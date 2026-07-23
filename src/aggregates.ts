@@ -43,64 +43,99 @@ interface PagedFetchResult {
   rows: Record<string, unknown>[];
   pagesFetched: number;
   truncated: boolean;
+  /** Records the Titan API could not serve (persistent 500s) that were skipped. */
+  skipped: number;
 }
 
-// Some Titan endpoints intermittently 500 on large pages (seen live on
-// /ProductionEntries with PlantID + date range at PageSize 500 but not 100),
-// so a 500 triggers one full retry at the fallback page size.
-const FALLBACK_PAGE_SIZE = 100;
+// Some Titan endpoints 500 when a corrupt record falls inside the requested
+// page (seen live on /ProductionEntries). A failing page is subdivided into
+// smaller pages so only the genuinely broken record(s) get skipped.
+const SUBDIVIDE: Record<number, number> = { 500: 100, 100: 20, 20: 4, 4: 1 };
+
+interface PageFetch {
+  rows: Record<string, unknown>[];
+  skipped: number;
+  pagination?: PaginationData;
+}
+
+async function fetchPageRecursive(
+  client: TitanClient,
+  path: string,
+  query: Record<string, unknown>,
+  pageNumber: number,
+  pageSize: number
+): Promise<PageFetch> {
+  try {
+    const data = await client.get(path, {
+      ...query,
+      PageNumber: pageNumber,
+      PageSize: pageSize,
+    });
+    const rows = Array.isArray(data.result) ? (data.result as Record<string, unknown>[]) : [];
+    return { rows, skipped: 0, pagination: (data.paginationData ?? undefined) as PaginationData | undefined };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    if (!/returned 500/.test(msg)) throw err;
+    const subSize = SUBDIVIDE[pageSize];
+    if (subSize == null) return { rows: [], skipped: pageSize };
+    const k = pageSize / subSize;
+    const result: PageFetch = { rows: [], skipped: 0 };
+    for (let i = 0; i < k; i++) {
+      const sub = await fetchPageRecursive(client, path, query, (pageNumber - 1) * k + i + 1, subSize);
+      result.rows.push(...sub.rows);
+      result.skipped += sub.skipped;
+      result.pagination ??= sub.pagination;
+    }
+    return result;
+  }
+}
 
 async function fetchAllPages(
   client: TitanClient,
   path: string,
   query: Record<string, unknown>
 ): Promise<PagedFetchResult> {
-  try {
-    return await fetchAllPagesAt(client, path, query, INTERNAL_PAGE_SIZE);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : "";
-    if (!/returned 500/.test(msg)) throw err;
-    return await fetchAllPagesAt(client, path, query, FALLBACK_PAGE_SIZE);
-  }
-}
-
-async function fetchAllPagesAt(
-  client: TitanClient,
-  path: string,
-  query: Record<string, unknown>,
-  pageSize: number
-): Promise<PagedFetchResult> {
   const rows: Record<string, unknown>[] = [];
   let pagesFetched = 0;
   let truncated = false;
+  let skipped = 0;
 
   for (let pageNumber = 1; ; pageNumber++) {
     if (pageNumber > MAX_PAGES) {
       truncated = true;
       break;
     }
-    const data = await client.get(path, {
-      ...query,
-      PageNumber: pageNumber,
-      PageSize: pageSize,
-    });
+    const page = await fetchPageRecursive(client, path, query, pageNumber, INTERNAL_PAGE_SIZE);
+    if (page.skipped >= INTERNAL_PAGE_SIZE && page.rows.length === 0) {
+      throw new Error(
+        `The Titan API is persistently failing for GET ${path} (an entire page of records ` +
+          "returned server errors); results would be unreliable, so the request was aborted."
+      );
+    }
     pagesFetched = pageNumber;
-    const pageRows = Array.isArray(data.result)
-      ? (data.result as Record<string, unknown>[])
-      : [];
-    rows.push(...pageRows);
+    rows.push(...page.rows);
+    skipped += page.skipped;
 
-    const pagination = (data.paginationData ?? undefined) as PaginationData | undefined;
-    if (pagination?.totalPages != null) {
-      if (pageNumber >= pagination.totalPages) break;
-    } else if (pagination?.nextPageLink == null && pageRows.length === 0) {
-      break;
-    } else if (pageRows.length === 0) {
+    const totalCount = page.pagination?.totalCount;
+    if (totalCount != null) {
+      if (pageNumber >= Math.ceil(totalCount / INTERNAL_PAGE_SIZE)) break;
+    } else if (page.rows.length === 0 && page.skipped === 0) {
       break;
     }
   }
-  return { rows, pagesFetched, truncated };
+  return { rows, pagesFetched, truncated, skipped };
 }
+
+/** Response fields reporting records the API could not serve; spread into results. */
+const skippedNote = (skipped: number) =>
+  skipped > 0
+    ? {
+        skippedRecords: skipped,
+        skippedNote:
+          `${skipped} record(s) could not be retrieved from the Titan API (persistent server ` +
+          "errors on those records) and are excluded from all sums.",
+      }
+    : {};
 
 function toNumber(value: unknown): number {
   const n = typeof value === "number" ? value : Number(value);
@@ -238,7 +273,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         CustomerId: args.CustomerId,
         JobStatus: args.JobStatus,
       };
-      const { rows, pagesFetched, truncated } = await fetchAllPages(
+      const { rows, pagesFetched, truncated, skipped } = await fetchAllPages(
         client,
         "/api/v1/SalesOrders",
         serverQuery
@@ -264,6 +299,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         ...(truncated
           ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` }
           : {}),
+        ...skippedNote(skipped),
       };
 
       if (matched.length > ORDER_DETAIL_CAP) {
@@ -328,7 +364,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         StartProductionDate: args.StartProductionDate,
         EndProductionDate: args.EndProductionDate,
       };
-      const { rows, pagesFetched, truncated } = await fetchAllPages(
+      const { rows, pagesFetched, truncated, skipped } = await fetchAllPages(
         client,
         "/api/v1/ProductionEntries",
         serverQuery
@@ -353,6 +389,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         ...(truncated
           ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` }
           : {}),
+        ...skippedNote(skipped),
       };
 
       if (kept.length > PRODUCTION_DETAIL_CAP) {
@@ -425,7 +462,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         StartDate: args.StartDate,
         EndDate: args.EndDate,
       };
-      const { rows, pagesFetched, truncated } = await fetchAllPages(
+      const { rows, pagesFetched, truncated, skipped } = await fetchAllPages(
         client,
         "/api/v1/Invoices",
         serverQuery
@@ -444,10 +481,12 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         scanned: rows.length,
         pagesFetched,
         ...(truncated ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` } : {}),
+        ...skippedNote(skipped),
         ...aggregate(kept, ["subtotal", "tax", "total"], "invoiceDate", args.GroupBy as string),
       };
     },
   },
 ];
+
 
 
