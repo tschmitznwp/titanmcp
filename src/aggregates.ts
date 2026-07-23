@@ -9,9 +9,9 @@ const INTERNAL_PAGE_SIZE = 500;
 const MAX_PAGES = 200;
 // The /SalesOrders list rows carry no value fields (and null customerId/plantId),
 // so values require fetching each matched order individually. Cap protects the API.
-const ORDER_DETAIL_CAP = 500;
+const ORDER_DETAIL_CAP = 5000;
 const PRODUCTION_DETAIL_CAP = 2500;
-const ORDER_DETAIL_CONCURRENCY = 8;
+const ORDER_DETAIL_CONCURRENCY = 12;
 
 async function mapLimit<T, R>(
   items: T[],
@@ -193,7 +193,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "orders server-side, fetches their values, and returns counts and summed " +
       "bookedValue/estimatedValue, optionally grouped. Use this instead of list_sales_orders " +
       "for questions about sales totals, e.g. a customer's annual sales. Dates filter on the " +
-      "order date (inclusive). Value sums are available when at most 500 orders match; for " +
+      "order date (inclusive). Value sums are available when at most 5000 orders match (a company-wide year is fine); for " +
       "broader questions narrow the filters or use summarize_invoices (billed revenue) instead.",
     params: {
       CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
@@ -415,4 +415,5 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     },
   },
 ];
+
 
