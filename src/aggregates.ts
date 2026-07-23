@@ -7,6 +7,28 @@ import type { TitanClient } from "./titanClient.js";
 
 const INTERNAL_PAGE_SIZE = 500;
 const MAX_PAGES = 200;
+// The /SalesOrders list rows carry no value fields (and null customerId/plantId),
+// so values require fetching each matched order individually. Cap protects the API.
+const ORDER_DETAIL_CAP = 500;
+const ORDER_DETAIL_CONCURRENCY = 8;
+
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) break;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 interface PaginationData {
   totalCount?: number;
@@ -90,7 +112,7 @@ const groupSpecs: Record<string, GroupSpec> = {
   year: { key: (row, dateField) => datePart(row[dateField]).slice(0, 4) || "unknown" },
   month: { key: (row, dateField) => datePart(row[dateField]).slice(0, 7) || "unknown" },
   customer: {
-    key: (row) => String(row.customerId ?? "unknown"),
+    key: (row) => String(row.customerId ?? row.customerName ?? row.name ?? "unknown"),
     label: (row) => (row.customerName ?? row.name) as string | undefined,
   },
   plant: { key: (row) => String(row.plantId ?? row.plantID ?? "unknown") },
@@ -161,10 +183,12 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     name: "summarize_sales_orders",
     title: "Summarize sales orders",
     description:
-      "Aggregates sales orders (bookings) without returning individual orders: pages through " +
-      "the full result set server-side and returns counts and summed bookedValue/estimatedValue, " +
-      "optionally grouped. Use this instead of list_sales_orders for questions about sales " +
-      "totals, e.g. a customer's annual sales. Dates filter on the order date (inclusive).",
+      "Aggregates sales orders (bookings) without returning individual orders: finds matching " +
+      "orders server-side, fetches their values, and returns counts and summed " +
+      "bookedValue/estimatedValue, optionally grouped. Use this instead of list_sales_orders " +
+      "for questions about sales totals, e.g. a customer's annual sales. Dates filter on the " +
+      "order date (inclusive). Value sums are available when at most 500 orders match; for " +
+      "broader questions narrow the filters or use summarize_invoices (billed revenue) instead.",
     params: {
       CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
       PlantId: z.string().optional().describe("Filter by plant ID."),
@@ -186,12 +210,13 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         "/api/v1/SalesOrders",
         serverQuery
       );
-      const matched = rows.filter(
-        (row) =>
-          inRange(datePart(row.orderDate), args.OrderDateStart as string, args.OrderDateEnd as string) &&
-          (args.PlantId == null || String(row.plantId) === String(args.PlantId))
+      // List rows only reliably carry jobNumber/orderDate/jobStatus; values,
+      // customerId, and plantId come from the per-order fetch below.
+      const matched = rows.filter((row) =>
+        inRange(datePart(row.orderDate), args.OrderDateStart as string, args.OrderDateEnd as string)
       );
-      return {
+
+      const base = {
         measure: "sales orders (bookings); sums are bookedValue and estimatedValue",
         filters: {
           CustomerId: args.CustomerId ?? null,
@@ -202,8 +227,37 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         },
         scanned: rows.length,
         pagesFetched,
-        ...(truncated ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` } : {}),
-        ...aggregate(matched, ["bookedValue", "estimatedValue"], "orderDate", args.GroupBy as string),
+        ...(truncated
+          ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` }
+          : {}),
+      };
+
+      if (matched.length > ORDER_DETAIL_CAP) {
+        return {
+          ...base,
+          count: matched.length,
+          totals: null,
+          message:
+            `${matched.length} orders match, which exceeds the ${ORDER_DETAIL_CAP}-order limit for ` +
+            "value summation (the Titan order list carries no value fields, so each order must be " +
+            "fetched individually). Narrow the filters (customer, shorter date range, job status) " +
+            "or use summarize_invoices for billed revenue over broad ranges." +
+            (args.PlantId != null ? " Note: the PlantId filter was NOT applied to this count." : ""),
+        };
+      }
+
+      const fullOrders = await mapLimit(matched, ORDER_DETAIL_CONCURRENCY, async (row) => {
+        const data = await client.get(
+          `/api/v1/SalesOrders/${encodeURIComponent(String(row.jobNumber))}`
+        );
+        return (data.result ?? {}) as Record<string, unknown>;
+      });
+      const filtered = fullOrders.filter(
+        (row) => args.PlantId == null || String(row.plantId) === String(args.PlantId)
+      );
+      return {
+        ...base,
+        ...aggregate(filtered, ["bookedValue", "estimatedValue"], "orderDate", args.GroupBy as string),
       };
     },
   },
