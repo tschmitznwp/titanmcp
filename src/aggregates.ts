@@ -1,4 +1,4 @@
-import { z, type ZodRawShape } from "zod";
+﻿import { z, type ZodRawShape } from "zod";
 import type { TitanClient } from "./titanClient.js";
 
 // Derived, read-only summary tools. Each pages through a Titan list endpoint
@@ -10,6 +10,7 @@ const MAX_PAGES = 200;
 // The /SalesOrders list rows carry no value fields (and null customerId/plantId),
 // so values require fetching each matched order individually. Cap protects the API.
 const ORDER_DETAIL_CAP = 500;
+const PRODUCTION_DETAIL_CAP = 2500;
 const ORDER_DETAIL_CONCURRENCY = 8;
 
 async function mapLimit<T, R>(
@@ -273,9 +274,10 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "Aggregates posted production output without returning individual entries: finds matching " +
       "production entries server-side (plant, department, type, production date range apply at " +
       "the API), fetches their detail lines, and returns summed quantity, quantityProd, yards, " +
-      "cubicMeters, and tons — optionally filtered to one product and/or grouped. Use this for " +
+      "cubicMeters, and tons â€” optionally filtered to one product and/or grouped. Use this for " +
       "questions like how many yards of a product were produced in a timeframe. Detail sums are " +
-      "available when at most 500 entries match; narrow the date range or plant if exceeded.",
+      "available when at most 2500 entries match (roughly a quarter company-wide); narrow the " +
+      "date range, plant, or department if exceeded.",
     params: {
       PlantID: z.string().optional().describe("Filter by plant ID."),
       ProductionDepartment: z.string().optional().describe("Filter by production department."),
@@ -321,12 +323,12 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           : {}),
       };
 
-      if (rows.length > ORDER_DETAIL_CAP) {
+      if (rows.length > PRODUCTION_DETAIL_CAP) {
         return {
           ...base,
           totals: null,
           message:
-            `${rows.length} production entries match, which exceeds the ${ORDER_DETAIL_CAP}-entry ` +
+            `${rows.length} production entries match, which exceeds the ${PRODUCTION_DETAIL_CAP}-entry ` +
             "limit for detail summation (the entry list carries no detail lines, so each entry " +
             "must be fetched individually). Narrow the production date range, plant, or department.",
         };
@@ -413,3 +415,4 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     },
   },
 ];
+
