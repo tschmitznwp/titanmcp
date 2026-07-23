@@ -193,8 +193,8 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "orders server-side, fetches their values, and returns counts and summed " +
       "bookedValue/estimatedValue, optionally grouped. Use this instead of list_sales_orders " +
       "for questions about sales totals, e.g. a customer's annual sales. Dates filter on the " +
-      "order date (inclusive). Value sums are available when at most 5000 orders match (a company-wide year is fine); for " +
-      "broader questions narrow the filters or use summarize_invoices (billed revenue) instead.",
+      "order date (inclusive). Value sums are available when at most 5000 orders match (a " +
+      "company-wide year is fine); narrow the filters if exceeded.",
     params: {
       CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
       PlantId: z.string().optional().describe("Filter by plant ID."),
@@ -247,7 +247,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
             `${matched.length} orders match, which exceeds the ${ORDER_DETAIL_CAP}-order limit for ` +
             "value summation (the Titan order list carries no value fields, so each order must be " +
             "fetched individually). Narrow the filters (customer, shorter date range, job status) " +
-            "or use summarize_invoices for billed revenue over broad ranges." +
+            "and call this tool again — do not substitute invoice data for sales." +
             (args.PlantId != null ? " Note: the PlantId filter was NOT applied to this count." : ""),
         };
       }
