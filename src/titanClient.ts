@@ -36,6 +36,10 @@ function formatValidationErrors(errors: Envelope["errors"]): string {
 export class TitanClient {
   constructor(private readonly config: TitanConfig) {}
 
+  get excludedPlants(): Set<string> {
+    return this.config.excludedPlants;
+  }
+
   async get(path: string, query: Record<string, unknown> = {}): Promise<TitanResponse> {
     const url = new URL(this.config.baseUrl + path);
     for (const [key, value] of Object.entries(query)) {

@@ -33,6 +33,7 @@ All configuration is via environment variables (see `.env.example`):
 | `TITAN_APP_ID` | yes | Sent as the `X-App-Id` header |
 | `TITAN_API_KEY` | yes | Sent as the `X-Api-Key` header |
 | `TITAN_MCP_PORT` | no | HTTP port (default `8585`) |
+| `TITAN_EXCLUDED_PLANTS` | no | Comma-separated plant IDs excluded from the `summarize_*` tools (e.g. inactive plants) |
 
 ## Running
 

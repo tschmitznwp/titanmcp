@@ -2,6 +2,8 @@ export interface TitanConfig {
   baseUrl: string;
   appId: string;
   apiKey: string;
+  /** Plant IDs (uppercased) excluded from the summarize_* aggregate tools. */
+  excludedPlants: Set<string>;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): TitanConfig {
@@ -20,9 +22,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): TitanConfig {
     );
   }
 
+  const excludedPlants = new Set(
+    (env.TITAN_EXCLUDED_PLANTS ?? "")
+      .split(",")
+      .map((p) => p.trim().toUpperCase())
+      .filter((p) => p.length > 0)
+  );
+
   return {
     baseUrl: baseUrl!.replace(/\/+$/, ""),
     appId: appId!,
     apiKey: apiKey!,
+    excludedPlants,
   };
 }

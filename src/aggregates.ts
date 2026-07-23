@@ -102,6 +102,13 @@ function inRange(dateYmd: string, start?: string, end?: string): boolean {
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+/** True unless the row's plant is in the configured TITAN_EXCLUDED_PLANTS set. */
+const plantAllowed = (excluded: Set<string>, plant: unknown): boolean =>
+  !excluded.has(String(plant ?? "").toUpperCase());
+
+const excludedPlantsNote = (excluded: Set<string>) =>
+  excluded.size > 0 ? { excludedPlants: [...excluded].sort() } : {};
+
 interface GroupSpec {
   /** Returns the grouping key for a row, e.g. "2025" or a customer ID. */
   key: (row: Record<string, unknown>, dateField: string) => string;
@@ -230,6 +237,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           JobStatus: args.JobStatus ?? null,
           OrderDateStart: args.OrderDateStart ?? null,
           OrderDateEnd: args.OrderDateEnd ?? null,
+          ...excludedPlantsNote(client.excludedPlants),
         },
         scanned: rows.length,
         pagesFetched,
@@ -259,7 +267,9 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         return (data.result ?? {}) as Record<string, unknown>;
       });
       const filtered = fullOrders.filter(
-        (row) => args.PlantId == null || String(row.plantId) === String(args.PlantId)
+        (row) =>
+          (args.PlantId == null || String(row.plantId) === String(args.PlantId)) &&
+          plantAllowed(client.excludedPlants, row.plantId)
       );
       return {
         ...base,
@@ -274,7 +284,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "Aggregates posted production output without returning individual entries: finds matching " +
       "production entries server-side (plant, department, type, production date range apply at " +
       "the API), fetches their detail lines, and returns summed quantity, quantityProd, yards, " +
-      "cubicMeters, and tons â€” optionally filtered to one product and/or grouped. Use this for " +
+      "cubicMeters, and tons - optionally filtered to one product and/or grouped. Use this for " +
       "questions like how many yards of a product were produced in a timeframe. Detail sums are " +
       "available when at most 2500 entries match (roughly a quarter company-wide); narrow the " +
       "date range, plant, or department if exceeded.",
@@ -303,6 +313,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         "/api/v1/ProductionEntries",
         serverQuery
       );
+      const kept = rows.filter((row) => plantAllowed(client.excludedPlants, row.plantID));
 
       const base = {
         measure:
@@ -315,26 +326,27 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           ProductID: args.ProductID ?? null,
           StartProductionDate: args.StartProductionDate ?? null,
           EndProductionDate: args.EndProductionDate ?? null,
+          ...excludedPlantsNote(client.excludedPlants),
         },
-        entriesMatched: rows.length,
+        entriesMatched: kept.length,
         pagesFetched,
         ...(truncated
           ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` }
           : {}),
       };
 
-      if (rows.length > PRODUCTION_DETAIL_CAP) {
+      if (kept.length > PRODUCTION_DETAIL_CAP) {
         return {
           ...base,
           totals: null,
           message:
-            `${rows.length} production entries match, which exceeds the ${PRODUCTION_DETAIL_CAP}-entry ` +
+            `${kept.length} production entries match, which exceeds the ${PRODUCTION_DETAIL_CAP}-entry ` +
             "limit for detail summation (the entry list carries no detail lines, so each entry " +
             "must be fetched individually). Narrow the production date range, plant, or department.",
         };
       }
 
-      const fullEntries = await mapLimit(rows, ORDER_DETAIL_CONCURRENCY, async (row) => {
+      const fullEntries = await mapLimit(kept, ORDER_DETAIL_CONCURRENCY, async (row) => {
         const data = await client.get(
           `/api/v1/ProductionEntries/${encodeURIComponent(String(row.productionID))}`
         );
@@ -398,6 +410,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         "/api/v1/Invoices",
         serverQuery
       );
+      const kept = rows.filter((row) => plantAllowed(client.excludedPlants, row.plantId));
       return {
         measure: "posted AR invoices (billed revenue); sums are subtotal, tax, and total",
         filters: {
@@ -406,11 +419,12 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           TicketType: args.TicketType ?? null,
           StartDate: args.StartDate ?? null,
           EndDate: args.EndDate ?? null,
+          ...excludedPlantsNote(client.excludedPlants),
         },
         scanned: rows.length,
         pagesFetched,
         ...(truncated ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` } : {}),
-        ...aggregate(rows, ["subtotal", "tax", "total"], "invoiceDate", args.GroupBy as string),
+        ...aggregate(kept, ["subtotal", "tax", "total"], "invoiceDate", args.GroupBy as string),
       };
     },
   },
