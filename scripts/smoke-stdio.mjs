@@ -3,7 +3,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-const EXPECTED_TOOL_COUNT = 34;
+const EXPECTED_TOOL_COUNT = 35;
 
 const transport = new StdioClientTransport({
   command: process.execPath,
@@ -40,4 +40,5 @@ if (result.isError !== true || !text.includes("Could not reach the Titan API")) 
 
 await client.close();
 console.log(`stdio smoke OK: ${tools.length} tools listed, unreachable-API error path verified.`);
+
 

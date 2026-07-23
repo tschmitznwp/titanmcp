@@ -18,7 +18,7 @@ plus derived read-only summary tools; no write (POST/PUT/upload) operations are 
 | Inventory | `list_inventory_receipts`, `get_inventory_receipt` |
 | Production | `list_production_entries`, `get_production_entry` |
 | Lookups | `list_currencies`, `list_plants`, `list_regions`, `list_price_levels`, `list_tax_codes`, `list_terms`, `list_sales_reps`, `list_sales_order_types`, `list_po_styles`, `list_lines_of_business` |
-| Summaries | `summarize_sales_orders`, `summarize_invoices` — aggregate totals (with optional grouping) computed server-side so large transaction sets never reach the model |
+| Summaries | `summarize_sales_orders`, `summarize_invoices`, `summarize_production` — aggregate totals (with optional grouping) computed server-side so large transaction sets never reach the model |
 
 List tools accept the API's filter parameters plus `PageNumber`/`PageSize`; responses
 include the API's `paginationData` when provided.

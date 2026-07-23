@@ -118,6 +118,11 @@ const groupSpecs: Record<string, GroupSpec> = {
   plant: { key: (row) => String(row.plantId ?? row.plantID ?? "unknown") },
   salesRep: { key: (row) => String(row.salesRep ?? "unknown") },
   jobStatus: { key: (row) => String(row.jobStatus ?? "unknown") },
+  product: {
+    key: (row) => String(row.productID ?? "unknown"),
+    label: (row) => row.description as string | undefined,
+  },
+  department: { key: (row) => String(row.productionDepartment ?? "unknown") },
 };
 
 function aggregate(
@@ -258,6 +263,103 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       return {
         ...base,
         ...aggregate(filtered, ["bookedValue", "estimatedValue"], "orderDate", args.GroupBy as string),
+      };
+    },
+  },
+  {
+    name: "summarize_production",
+    title: "Summarize production",
+    description:
+      "Aggregates posted production output without returning individual entries: finds matching " +
+      "production entries server-side (plant, department, type, production date range apply at " +
+      "the API), fetches their detail lines, and returns summed quantity, quantityProd, yards, " +
+      "cubicMeters, and tons — optionally filtered to one product and/or grouped. Use this for " +
+      "questions like how many yards of a product were produced in a timeframe. Detail sums are " +
+      "available when at most 500 entries match; narrow the date range or plant if exceeded.",
+    params: {
+      PlantID: z.string().optional().describe("Filter by plant ID."),
+      ProductionDepartment: z.string().optional().describe("Filter by production department."),
+      Type: z.string().optional().describe("Filter by entry type (e.g. Standard, Reversal)."),
+      ProductID: z.string().optional().describe("Only count detail lines for this product ID."),
+      StartProductionDate: z.string().optional().describe("Production date range start (YYYY-MM-DD, inclusive)."),
+      EndProductionDate: z.string().optional().describe("Production date range end (YYYY-MM-DD, inclusive)."),
+      GroupBy: groupByParam(
+        ["year", "month", "plant", "product", "department"],
+        "year, month, plant, product, or department"
+      ),
+    },
+    handler: async (client, args) => {
+      const serverQuery: Record<string, unknown> = {
+        PlantID: args.PlantID,
+        ProductionDepartment: args.ProductionDepartment,
+        Type: args.Type,
+        StartProductionDate: args.StartProductionDate,
+        EndProductionDate: args.EndProductionDate,
+      };
+      const { rows, pagesFetched, truncated } = await fetchAllPages(
+        client,
+        "/api/v1/ProductionEntries",
+        serverQuery
+      );
+
+      const base = {
+        measure:
+          "posted production entry detail lines; sums are quantity (scheduled), " +
+          "quantityProd (produced), yards, cubicMeters, and tons",
+        filters: {
+          PlantID: args.PlantID ?? null,
+          ProductionDepartment: args.ProductionDepartment ?? null,
+          Type: args.Type ?? null,
+          ProductID: args.ProductID ?? null,
+          StartProductionDate: args.StartProductionDate ?? null,
+          EndProductionDate: args.EndProductionDate ?? null,
+        },
+        entriesMatched: rows.length,
+        pagesFetched,
+        ...(truncated
+          ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` }
+          : {}),
+      };
+
+      if (rows.length > ORDER_DETAIL_CAP) {
+        return {
+          ...base,
+          totals: null,
+          message:
+            `${rows.length} production entries match, which exceeds the ${ORDER_DETAIL_CAP}-entry ` +
+            "limit for detail summation (the entry list carries no detail lines, so each entry " +
+            "must be fetched individually). Narrow the production date range, plant, or department.",
+        };
+      }
+
+      const fullEntries = await mapLimit(rows, ORDER_DETAIL_CONCURRENCY, async (row) => {
+        const data = await client.get(
+          `/api/v1/ProductionEntries/${encodeURIComponent(String(row.productionID))}`
+        );
+        return (data.result ?? {}) as Record<string, unknown>;
+      });
+      let lines = fullEntries.flatMap((entry) =>
+        (Array.isArray(entry.details) ? (entry.details as Record<string, unknown>[]) : []).map(
+          (line) => ({
+            ...line,
+            date: entry.date,
+            productionDepartment: line.productionDepartment ?? entry.productionDepartment,
+            plantID: line.plantID ?? entry.plantID,
+          })
+        )
+      );
+      if (args.ProductID != null) {
+        const wanted = String(args.ProductID).toUpperCase();
+        lines = lines.filter((line) => String(line.productID ?? "").toUpperCase() === wanted);
+      }
+      return {
+        ...base,
+        ...aggregate(
+          lines,
+          ["quantity", "quantityProd", "yards", "cubicMeters", "tons"],
+          "date",
+          args.GroupBy as string
+        ),
       };
     },
   },
