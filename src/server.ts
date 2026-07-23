@@ -1,10 +1,10 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { TitanClient } from "./titanClient.js";
 import { toolDefs, type ToolDef } from "./tools.js";
 import { aggregateToolDefs } from "./aggregates.js";
 
-export const SERVER_INFO = { name: "titan-mcp", version: "1.3.0" };
+export const SERVER_INFO = { name: "titan-mcp", version: "1.3.1" };
 
 function splitArgs(
   def: ToolDef,
@@ -95,3 +95,4 @@ export function buildServer(client: TitanClient): McpServer {
 
   return server;
 }
+

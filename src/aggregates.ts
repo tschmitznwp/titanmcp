@@ -45,10 +45,30 @@ interface PagedFetchResult {
   truncated: boolean;
 }
 
+// Some Titan endpoints intermittently 500 on large pages (seen live on
+// /ProductionEntries with PlantID + date range at PageSize 500 but not 100),
+// so a 500 triggers one full retry at the fallback page size.
+const FALLBACK_PAGE_SIZE = 100;
+
 async function fetchAllPages(
   client: TitanClient,
   path: string,
   query: Record<string, unknown>
+): Promise<PagedFetchResult> {
+  try {
+    return await fetchAllPagesAt(client, path, query, INTERNAL_PAGE_SIZE);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    if (!/returned 500/.test(msg)) throw err;
+    return await fetchAllPagesAt(client, path, query, FALLBACK_PAGE_SIZE);
+  }
+}
+
+async function fetchAllPagesAt(
+  client: TitanClient,
+  path: string,
+  query: Record<string, unknown>,
+  pageSize: number
 ): Promise<PagedFetchResult> {
   const rows: Record<string, unknown>[] = [];
   let pagesFetched = 0;
@@ -62,7 +82,7 @@ async function fetchAllPages(
     const data = await client.get(path, {
       ...query,
       PageNumber: pageNumber,
-      PageSize: INTERNAL_PAGE_SIZE,
+      PageSize: pageSize,
     });
     pagesFetched = pageNumber;
     const pageRows = Array.isArray(data.result)
