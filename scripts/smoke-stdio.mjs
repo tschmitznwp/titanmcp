@@ -1,9 +1,9 @@
-// Charter checks 5.2/5.3/5.5 (stdio side): server starts on stdio, lists all
+﻿// Charter checks 5.2/5.3/5.5 (stdio side): server starts on stdio, lists all
 // tools with input schemas, and returns a clear error when the API is unreachable.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-const EXPECTED_TOOL_COUNT = 32;
+const EXPECTED_TOOL_COUNT = 34;
 
 const transport = new StdioClientTransport({
   command: process.execPath,
@@ -40,3 +40,4 @@ if (result.isError !== true || !text.includes("Could not reach the Titan API")) 
 
 await client.close();
 console.log(`stdio smoke OK: ${tools.length} tools listed, unreachable-API error path verified.`);
+

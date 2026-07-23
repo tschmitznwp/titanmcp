@@ -1,10 +1,10 @@
-// Charter checks 5.2/5.3 (HTTP side): server starts in Streamable HTTP mode and
+﻿// Charter checks 5.2/5.3 (HTTP side): server starts in Streamable HTTP mode and
 // an MCP client can initialize and list all tools over POST /mcp.
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const EXPECTED_TOOL_COUNT = 32;
+const EXPECTED_TOOL_COUNT = 34;
 const PORT = 8599;
 
 const child = spawn(process.execPath, ["dist/index.js"], {
@@ -58,3 +58,4 @@ try {
 } finally {
   child.kill();
 }
+

@@ -1,0 +1,259 @@
+import { z, type ZodRawShape } from "zod";
+import type { TitanClient } from "./titanClient.js";
+
+// Derived, read-only summary tools. Each pages through a Titan list endpoint
+// inside this server (cheap HTTP round-trips) and returns only aggregate
+// numbers, so large transaction histories never enter the model's context.
+
+const INTERNAL_PAGE_SIZE = 500;
+const MAX_PAGES = 200;
+
+interface PaginationData {
+  totalCount?: number;
+  pageSize?: number;
+  currentPage?: number;
+  totalPages?: number;
+  nextPageLink?: string | null;
+}
+
+interface PagedFetchResult {
+  rows: Record<string, unknown>[];
+  pagesFetched: number;
+  truncated: boolean;
+}
+
+async function fetchAllPages(
+  client: TitanClient,
+  path: string,
+  query: Record<string, unknown>
+): Promise<PagedFetchResult> {
+  const rows: Record<string, unknown>[] = [];
+  let pagesFetched = 0;
+  let truncated = false;
+
+  for (let pageNumber = 1; ; pageNumber++) {
+    if (pageNumber > MAX_PAGES) {
+      truncated = true;
+      break;
+    }
+    const data = await client.get(path, {
+      ...query,
+      PageNumber: pageNumber,
+      PageSize: INTERNAL_PAGE_SIZE,
+    });
+    pagesFetched = pageNumber;
+    const pageRows = Array.isArray(data.result)
+      ? (data.result as Record<string, unknown>[])
+      : [];
+    rows.push(...pageRows);
+
+    const pagination = (data.paginationData ?? undefined) as PaginationData | undefined;
+    if (pagination?.totalPages != null) {
+      if (pageNumber >= pagination.totalPages) break;
+    } else if (pagination?.nextPageLink == null && pageRows.length === 0) {
+      break;
+    } else if (pageRows.length === 0) {
+      break;
+    }
+  }
+  return { rows, pagesFetched, truncated };
+}
+
+function toNumber(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** Normalizes an ISO date/date-time string to YYYY-MM-DD; empty string if absent. */
+function datePart(value: unknown): string {
+  return typeof value === "string" ? value.slice(0, 10) : "";
+}
+
+function inRange(dateYmd: string, start?: string, end?: string): boolean {
+  if (!start && !end) return true;
+  if (!dateYmd) return false;
+  if (start && dateYmd < start.slice(0, 10)) return false;
+  if (end && dateYmd > end.slice(0, 10)) return false;
+  return true;
+}
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+interface GroupSpec {
+  /** Returns the grouping key for a row, e.g. "2025" or a customer ID. */
+  key: (row: Record<string, unknown>, dateField: string) => string;
+  /** Optional human-readable label field captured from the first row seen. */
+  label?: (row: Record<string, unknown>) => string | undefined;
+}
+
+const groupSpecs: Record<string, GroupSpec> = {
+  year: { key: (row, dateField) => datePart(row[dateField]).slice(0, 4) || "unknown" },
+  month: { key: (row, dateField) => datePart(row[dateField]).slice(0, 7) || "unknown" },
+  customer: {
+    key: (row) => String(row.customerId ?? "unknown"),
+    label: (row) => (row.customerName ?? row.name) as string | undefined,
+  },
+  plant: { key: (row) => String(row.plantId ?? row.plantID ?? "unknown") },
+  salesRep: { key: (row) => String(row.salesRep ?? "unknown") },
+  jobStatus: { key: (row) => String(row.jobStatus ?? "unknown") },
+};
+
+function aggregate(
+  rows: Record<string, unknown>[],
+  sumFields: string[],
+  dateField: string,
+  groupBy?: string
+): {
+  count: number;
+  totals: Record<string, number>;
+  groups?: Record<string, unknown>[];
+} {
+  const totals: Record<string, number> = Object.fromEntries(sumFields.map((f) => [f, 0]));
+  for (const row of rows) {
+    for (const f of sumFields) totals[f] += toNumber(row[f]);
+  }
+  for (const f of sumFields) totals[f] = round2(totals[f]);
+
+  const result: ReturnType<typeof aggregate> = { count: rows.length, totals };
+
+  const spec = groupBy ? groupSpecs[groupBy] : undefined;
+  if (spec) {
+    const byKey = new Map<string, { count: number; label?: string; sums: Record<string, number> }>();
+    for (const row of rows) {
+      const key = spec.key(row, dateField);
+      let bucket = byKey.get(key);
+      if (!bucket) {
+        bucket = {
+          count: 0,
+          ...(spec.label ? { label: spec.label(row) } : {}),
+          sums: Object.fromEntries(sumFields.map((f) => [f, 0])),
+        };
+        byKey.set(key, bucket);
+      }
+      bucket.count++;
+      for (const f of sumFields) bucket.sums[f] += toNumber(row[f]);
+    }
+    result.groups = [...byKey.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, bucket]) => ({
+        [groupBy!]: key,
+        ...(bucket.label !== undefined ? { name: bucket.label } : {}),
+        count: bucket.count,
+        ...Object.fromEntries(sumFields.map((f) => [f, round2(bucket.sums[f])])),
+      }));
+  }
+  return result;
+}
+
+export interface AggregateToolDef {
+  name: string;
+  title: string;
+  description: string;
+  params: ZodRawShape;
+  handler: (client: TitanClient, args: Record<string, unknown>) => Promise<unknown>;
+}
+
+const groupByParam = (values: [string, ...string[]], hint: string) =>
+  z.enum(values).optional().describe(`Optional grouping for subtotals: ${hint}.`);
+
+export const aggregateToolDefs: AggregateToolDef[] = [
+  {
+    name: "summarize_sales_orders",
+    title: "Summarize sales orders",
+    description:
+      "Aggregates sales orders (bookings) without returning individual orders: pages through " +
+      "the full result set server-side and returns counts and summed bookedValue/estimatedValue, " +
+      "optionally grouped. Use this instead of list_sales_orders for questions about sales " +
+      "totals, e.g. a customer's annual sales. Dates filter on the order date (inclusive).",
+    params: {
+      CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
+      PlantId: z.string().optional().describe("Filter by plant ID."),
+      JobStatus: z.string().optional().describe("Filter by job status."),
+      OrderDateStart: z.string().optional().describe("Order date range start (YYYY-MM-DD, inclusive)."),
+      OrderDateEnd: z.string().optional().describe("Order date range end (YYYY-MM-DD, inclusive)."),
+      GroupBy: groupByParam(
+        ["year", "month", "customer", "plant", "jobStatus", "salesRep"],
+        "year, month, customer, plant, jobStatus, or salesRep"
+      ),
+    },
+    handler: async (client, args) => {
+      const serverQuery: Record<string, unknown> = {
+        CustomerId: args.CustomerId,
+        JobStatus: args.JobStatus,
+      };
+      const { rows, pagesFetched, truncated } = await fetchAllPages(
+        client,
+        "/api/v1/SalesOrders",
+        serverQuery
+      );
+      const matched = rows.filter(
+        (row) =>
+          inRange(datePart(row.orderDate), args.OrderDateStart as string, args.OrderDateEnd as string) &&
+          (args.PlantId == null || String(row.plantId) === String(args.PlantId))
+      );
+      return {
+        measure: "sales orders (bookings); sums are bookedValue and estimatedValue",
+        filters: {
+          CustomerId: args.CustomerId ?? null,
+          PlantId: args.PlantId ?? null,
+          JobStatus: args.JobStatus ?? null,
+          OrderDateStart: args.OrderDateStart ?? null,
+          OrderDateEnd: args.OrderDateEnd ?? null,
+        },
+        scanned: rows.length,
+        pagesFetched,
+        ...(truncated ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` } : {}),
+        ...aggregate(matched, ["bookedValue", "estimatedValue"], "orderDate", args.GroupBy as string),
+      };
+    },
+  },
+  {
+    name: "summarize_invoices",
+    title: "Summarize invoices",
+    description:
+      "Aggregates posted customer (AR) invoices without returning individual invoices: pages " +
+      "through the full result set server-side and returns counts and summed subtotal/tax/total, " +
+      "optionally grouped. Use this instead of list_invoices for questions about invoiced/billed " +
+      "revenue totals. Dates filter on the invoice date (inclusive). Credit invoices are included " +
+      "as returned by the API (negative or credit amounts net against totals).",
+    params: {
+      CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
+      PlantId: z.string().optional().describe("Filter by plant ID."),
+      TicketType: z.string().optional().describe("Filter by ticket type."),
+      StartDate: z.string().optional().describe("Invoice date range start (YYYY-MM-DD, inclusive)."),
+      EndDate: z.string().optional().describe("Invoice date range end (YYYY-MM-DD, inclusive)."),
+      GroupBy: groupByParam(
+        ["year", "month", "customer", "plant", "salesRep"],
+        "year, month, customer, plant, or salesRep"
+      ),
+    },
+    handler: async (client, args) => {
+      const serverQuery: Record<string, unknown> = {
+        CustomerId: args.CustomerId,
+        PlantId: args.PlantId,
+        TicketType: args.TicketType,
+        StartDate: args.StartDate,
+        EndDate: args.EndDate,
+      };
+      const { rows, pagesFetched, truncated } = await fetchAllPages(
+        client,
+        "/api/v1/Invoices",
+        serverQuery
+      );
+      return {
+        measure: "posted AR invoices (billed revenue); sums are subtotal, tax, and total",
+        filters: {
+          CustomerId: args.CustomerId ?? null,
+          PlantId: args.PlantId ?? null,
+          TicketType: args.TicketType ?? null,
+          StartDate: args.StartDate ?? null,
+          EndDate: args.EndDate ?? null,
+        },
+        scanned: rows.length,
+        pagesFetched,
+        ...(truncated ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` } : {}),
+        ...aggregate(rows, ["subtotal", "tax", "total"], "invoiceDate", args.GroupBy as string),
+      };
+    },
+  },
+];

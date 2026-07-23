@@ -1,8 +1,8 @@
 # titan-mcp
 
 Read-only [MCP](https://modelcontextprotocol.io) server for the **Titan 3000 Web API (V1)**,
-built for use with **Open WebUI**. Exposes all 32 GET endpoints of the API as MCP tools;
-no write (POST/PUT/upload) operations are included.
+built for use with **Open WebUI**. Exposes all 32 GET endpoints of the API as MCP tools,
+plus derived read-only summary tools; no write (POST/PUT/upload) operations are included.
 
 ## Tools
 
@@ -18,6 +18,7 @@ no write (POST/PUT/upload) operations are included.
 | Inventory | `list_inventory_receipts`, `get_inventory_receipt` |
 | Production | `list_production_entries`, `get_production_entry` |
 | Lookups | `list_currencies`, `list_plants`, `list_regions`, `list_price_levels`, `list_tax_codes`, `list_terms`, `list_sales_reps`, `list_sales_order_types`, `list_po_styles`, `list_lines_of_business` |
+| Summaries | `summarize_sales_orders`, `summarize_invoices` — aggregate totals (with optional grouping) computed server-side so large transaction sets never reach the model |
 
 List tools accept the API's filter parameters plus `PageNumber`/`PageSize`; responses
 include the API's `paginationData` when provided.
