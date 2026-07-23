@@ -182,7 +182,7 @@ const groupSpecs: Record<string, GroupSpec> = {
   salesRep: { key: (row) => String(row.salesRep ?? "unknown") },
   jobStatus: { key: (row) => String(row.jobStatus ?? "unknown") },
   product: {
-    key: (row) => String(row.productID ?? "unknown"),
+    key: (row) => String(row.productID ?? row.productId ?? "unknown"),
     label: (row) => row.description as string | undefined,
   },
   department: { key: (row) => String(row.productionDepartment ?? "unknown") },
@@ -256,16 +256,20 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "bookedValue/estimatedValue, optionally grouped. Use this instead of list_sales_orders " +
       "for questions about sales totals, e.g. a customer's annual sales. Dates filter on the " +
       "order date (inclusive). Value sums are available when at most 5000 orders match (a " +
-      "company-wide year is fine); narrow the filters if exceeded.",
+      "company-wide year is fine); narrow the filters if exceeded. GroupBy product (or a " +
+      "ProductID filter) switches to order DETAIL LINES and sums sellValue " +
+      "(quantityOrdered x sellUnitPrice), quantityOrdered, and yards per product - use that " +
+      "for questions like which products sold the most in dollars.",
     params: {
       CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
       PlantId: z.string().optional().describe("Filter by plant ID."),
       JobStatus: z.string().optional().describe("Filter by job status."),
+      ProductID: z.string().optional().describe("Only count order detail lines for this product ID."),
       OrderDateStart: z.string().optional().describe("Order date range start (YYYY-MM-DD, inclusive)."),
       OrderDateEnd: z.string().optional().describe("Order date range end (YYYY-MM-DD, inclusive)."),
       GroupBy: groupByParam(
-        ["year", "month", "customer", "plant", "jobStatus", "salesRep"],
-        "year, month, customer, plant, jobStatus, or salesRep"
+        ["year", "month", "customer", "plant", "jobStatus", "salesRep", "product"],
+        "year, month, customer, plant, jobStatus, salesRep, or product (product switches to detail-line sums)"
       ),
     },
     handler: async (client, args) => {
@@ -290,6 +294,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           CustomerId: args.CustomerId ?? null,
           PlantId: args.PlantId ?? null,
           JobStatus: args.JobStatus ?? null,
+          ProductID: args.ProductID ?? null,
           OrderDateStart: args.OrderDateStart ?? null,
           OrderDateEnd: args.OrderDateEnd ?? null,
           ...excludedPlantsNote(client.excludedPlants),
@@ -313,6 +318,51 @@ export const aggregateToolDefs: AggregateToolDef[] = [
             "fetched individually). Narrow the filters (customer, shorter date range, job status) " +
             "and call this tool again — do not substitute invoice data for sales." +
             (args.PlantId != null ? " Note: the PlantId filter was NOT applied to this count." : ""),
+        };
+      }
+
+      // Product mode: dollar value per product lives on order detail lines
+      // (sellValue = quantityOrdered x sellUnitPrice, confirmed with the user).
+      if (args.GroupBy === "product" || args.ProductID != null) {
+        const detailBatches = await mapLimit(matched, ORDER_DETAIL_CONCURRENCY, async (row) => {
+          const details = await fetchAllPages(
+            client,
+            `/api/v1/salesorders/${encodeURIComponent(String(row.jobNumber))}/SalesOrderDetails`,
+            {}
+          );
+          return details.rows.map(
+            (line): Record<string, unknown> => ({
+              ...line,
+              orderDate: row.orderDate,
+              customerName: row.customerName,
+              sellValue: toNumber(line.quantityOrdered) * toNumber(line.sellUnitPrice),
+            })
+          );
+        });
+        let lines = detailBatches
+          .flat()
+          .filter(
+            (line) =>
+              plantAllowed(client.excludedPlants, line.plantID) &&
+              (args.PlantId == null || String(line.plantID) === String(args.PlantId))
+          );
+        if (args.ProductID != null) {
+          const wanted = String(args.ProductID).toUpperCase();
+          lines = lines.filter(
+            (line) => String(line.productId ?? line.productID ?? "").toUpperCase() === wanted
+          );
+        }
+        return {
+          ...base,
+          measure:
+            "sales order detail lines (bookings); sums are sellValue " +
+            "(quantityOrdered x sellUnitPrice), quantityOrdered, and yards",
+          ...aggregate(
+            lines,
+            ["sellValue", "quantityOrdered", "yards"],
+            "orderDate",
+            (args.GroupBy as string) ?? "product"
+          ),
         };
       }
 
