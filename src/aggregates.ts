@@ -338,9 +338,9 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         );
         return (data.result ?? {}) as Record<string, unknown>;
       });
-      let lines = fullEntries.flatMap((entry) =>
+      let lines: Record<string, unknown>[] = fullEntries.flatMap((entry) =>
         (Array.isArray(entry.details) ? (entry.details as Record<string, unknown>[]) : []).map(
-          (line) => ({
+          (line): Record<string, unknown> => ({
             ...line,
             date: entry.date,
             productionDepartment: line.productionDepartment ?? entry.productionDepartment,
