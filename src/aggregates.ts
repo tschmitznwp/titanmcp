@@ -1,5 +1,5 @@
 ﻿import { z, type ZodRawShape } from "zod";
-import type { TitanClient } from "./titanClient.js";
+import type { ProductCatalog, TitanClient } from "./titanClient.js";
 
 // Derived, read-only summary tools. Each pages through a Titan list endpoint
 // inside this server (cheap HTTP round-trips) and returns only aggregate
@@ -164,6 +164,49 @@ const plantAllowed = (excluded: Set<string>, plant: unknown): boolean =>
 const excludedPlantsNote = (excluded: Set<string>) =>
   excluded.size > 0 ? { excludedPlants: [...excluded].sort() } : {};
 
+async function tryGetProductCatalog(client: TitanClient): Promise<ProductCatalog | undefined> {
+  try {
+    return await client.getProductCatalog();
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveProduct(productID: string, catalog: ProductCatalog | undefined) {
+  const hit = catalog?.get(productID);
+  return {
+    productID,
+    productName: hit?.description ?? null,
+    resolved: hit != null,
+    ...(hit?.unitOfMeasure ? { unitOfMeasure: hit.unitOfMeasure } : {}),
+  };
+}
+
+function enrichProductGroups(
+  groups: Record<string, unknown>[] | undefined,
+  catalog: ProductCatalog | undefined
+): Record<string, unknown>[] | undefined {
+  if (!groups || !catalog) return groups;
+  return groups.map((g) => {
+    const productID = g.product;
+    if (typeof productID !== "string") return g;
+    const hit = catalog.get(productID);
+    return {
+      ...g,
+      productName: hit?.description ?? null,
+      resolved: hit != null,
+      ...(hit?.unitOfMeasure ? { unitOfMeasure: hit.unitOfMeasure } : {}),
+    };
+  });
+}
+
+const CATALOG_UNAVAILABLE_NOTE = {
+  productCatalogUnavailable: true,
+  productCatalogNote:
+    "The product catalog could not be fetched from the Titan API, so productIDs in this " +
+    "response are unverified. Present them as raw codes without inventing product names.",
+};
+
 interface GroupSpec {
   /** Returns the grouping key for a row, e.g. "2025" or a customer ID. */
   key: (row: Record<string, unknown>, dateField: string) => string;
@@ -259,7 +302,10 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "company-wide year is fine); narrow the filters if exceeded. GroupBy product (or a " +
       "ProductID filter) switches to order DETAIL LINES and sums sellValue " +
       "(quantityOrdered x sellUnitPrice), quantityOrdered, and yards per product - use that " +
-      "for questions like which products sold the most in dollars.",
+      "for questions like which products sold the most in dollars. When grouped by product " +
+      "each group is enriched with productName (from the Titan product catalog) and a resolved " +
+      "boolean; resolved=false means the productID has no catalog entry - report it verbatim " +
+      "and do NOT invent a name for it.",
     params: {
       CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
       PlantId: z.string().optional().describe("Filter by plant ID."),
@@ -324,21 +370,24 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       // Product mode: dollar value per product lives on order detail lines
       // (sellValue = quantityOrdered x sellUnitPrice, confirmed with the user).
       if (args.GroupBy === "product" || args.ProductID != null) {
-        const detailBatches = await mapLimit(matched, ORDER_DETAIL_CONCURRENCY, async (row) => {
-          const details = await fetchAllPages(
-            client,
-            `/api/v1/salesorders/${encodeURIComponent(String(row.jobNumber))}/SalesOrderDetails`,
-            {}
-          );
-          return details.rows.map(
-            (line): Record<string, unknown> => ({
-              ...line,
-              orderDate: row.orderDate,
-              customerName: row.customerName,
-              sellValue: toNumber(line.quantityOrdered) * toNumber(line.sellUnitPrice),
-            })
-          );
-        });
+        const [detailBatches, catalog] = await Promise.all([
+          mapLimit(matched, ORDER_DETAIL_CONCURRENCY, async (row) => {
+            const details = await fetchAllPages(
+              client,
+              `/api/v1/salesorders/${encodeURIComponent(String(row.jobNumber))}/SalesOrderDetails`,
+              {}
+            );
+            return details.rows.map(
+              (line): Record<string, unknown> => ({
+                ...line,
+                orderDate: row.orderDate,
+                customerName: row.customerName,
+                sellValue: toNumber(line.quantityOrdered) * toNumber(line.sellUnitPrice),
+              })
+            );
+          }),
+          tryGetProductCatalog(client),
+        ]);
         let lines = detailBatches
           .flat()
           .filter(
@@ -352,17 +401,21 @@ export const aggregateToolDefs: AggregateToolDef[] = [
             (line) => String(line.productId ?? line.productID ?? "").toUpperCase() === wanted
           );
         }
+        const effectiveGroupBy = (args.GroupBy as string) ?? "product";
+        const agg = aggregate(lines, ["sellValue", "quantityOrdered", "yards"], "orderDate", effectiveGroupBy);
         return {
           ...base,
           measure:
             "sales order detail lines (bookings); sums are sellValue " +
             "(quantityOrdered x sellUnitPrice), quantityOrdered, and yards",
-          ...aggregate(
-            lines,
-            ["sellValue", "quantityOrdered", "yards"],
-            "orderDate",
-            (args.GroupBy as string) ?? "product"
-          ),
+          ...agg,
+          ...(effectiveGroupBy === "product"
+            ? { groups: enrichProductGroups(agg.groups, catalog) }
+            : {}),
+          ...(args.ProductID != null
+            ? { product: resolveProduct(String(args.ProductID), catalog) }
+            : {}),
+          ...(catalog == null ? CATALOG_UNAVAILABLE_NOTE : {}),
         };
       }
 
@@ -393,7 +446,10 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "cubicMeters, and tons - optionally filtered to one product and/or grouped. Use this for " +
       "questions like how many yards of a product were produced in a timeframe. Detail sums are " +
       "available when at most 2500 entries match (roughly a quarter company-wide); narrow the " +
-      "date range, plant, or department if exceeded.",
+      "date range, plant, or department if exceeded. When grouped by product each group is " +
+      "enriched with productName (from the Titan product catalog) and a resolved boolean; " +
+      "resolved=false means the productID has no catalog entry - report it verbatim and do NOT " +
+      "invent a name for it.",
     params: {
       PlantID: z.string().optional().describe("Filter by plant ID."),
       ProductionDepartment: z.string().optional().describe("Filter by production department."),
@@ -453,12 +509,17 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         };
       }
 
-      const fullEntries = await mapLimit(kept, ORDER_DETAIL_CONCURRENCY, async (row) => {
-        const data = await client.get(
-          `/api/v1/ProductionEntries/${encodeURIComponent(String(row.productionID))}`
-        );
-        return (data.result ?? {}) as Record<string, unknown>;
-      });
+      const [fullEntries, catalog] = await Promise.all([
+        mapLimit(kept, ORDER_DETAIL_CONCURRENCY, async (row) => {
+          const data = await client.get(
+            `/api/v1/ProductionEntries/${encodeURIComponent(String(row.productionID))}`
+          );
+          return (data.result ?? {}) as Record<string, unknown>;
+        }),
+        args.GroupBy === "product" || args.ProductID != null
+          ? tryGetProductCatalog(client)
+          : Promise.resolve(undefined),
+      ]);
       let lines: Record<string, unknown>[] = fullEntries.flatMap((entry) =>
         (Array.isArray(entry.details) ? (entry.details as Record<string, unknown>[]) : []).map(
           (line): Record<string, unknown> => ({
@@ -473,14 +534,23 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         const wanted = String(args.ProductID).toUpperCase();
         lines = lines.filter((line) => String(line.productID ?? "").toUpperCase() === wanted);
       }
+      const agg = aggregate(
+        lines,
+        ["quantity", "quantityProd", "yards", "cubicMeters", "tons"],
+        "date",
+        args.GroupBy as string
+      );
+      const catalogUsed = args.GroupBy === "product" || args.ProductID != null;
       return {
         ...base,
-        ...aggregate(
-          lines,
-          ["quantity", "quantityProd", "yards", "cubicMeters", "tons"],
-          "date",
-          args.GroupBy as string
-        ),
+        ...agg,
+        ...(args.GroupBy === "product"
+          ? { groups: enrichProductGroups(agg.groups, catalog) }
+          : {}),
+        ...(args.ProductID != null
+          ? { product: resolveProduct(String(args.ProductID), catalog) }
+          : {}),
+        ...(catalogUsed && catalog == null ? CATALOG_UNAVAILABLE_NOTE : {}),
       };
     },
   },

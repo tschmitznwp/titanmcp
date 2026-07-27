@@ -20,6 +20,18 @@ export interface TitanResponse {
   paginationData?: unknown;
 }
 
+export interface CatalogProduct {
+  productID: string;
+  description?: string;
+  unitOfMeasure?: string;
+}
+
+export type ProductCatalog = Map<string, CatalogProduct>;
+
+const PRODUCT_CATALOG_TTL_MS = 30 * 60 * 1000;
+const PRODUCT_CATALOG_PAGE_SIZE = 500;
+const PRODUCT_CATALOG_MAX_PAGES = 200;
+
 function truncate(text: string, max = 500): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
@@ -36,8 +48,51 @@ function formatValidationErrors(errors: Envelope["errors"]): string {
 export class TitanClient {
   constructor(private readonly config: TitanConfig) {}
 
+  private productCatalogCache?: { at: number; catalog: ProductCatalog };
+  private productCatalogInFlight?: Promise<ProductCatalog>;
+
   get excludedPlants(): Set<string> {
     return this.config.excludedPlants;
+  }
+
+  async getProductCatalog(): Promise<ProductCatalog> {
+    const cached = this.productCatalogCache;
+    if (cached && Date.now() - cached.at < PRODUCT_CATALOG_TTL_MS) return cached.catalog;
+    if (this.productCatalogInFlight) return this.productCatalogInFlight;
+    this.productCatalogInFlight = (async () => {
+      try {
+        const map: ProductCatalog = new Map();
+        for (let page = 1; page <= PRODUCT_CATALOG_MAX_PAGES; page++) {
+          const data = await this.get("/api/v1/Products", {
+            PageNumber: page,
+            PageSize: PRODUCT_CATALOG_PAGE_SIZE,
+          });
+          const rows = Array.isArray(data.result) ? (data.result as Record<string, unknown>[]) : [];
+          for (const row of rows) {
+            const pid = row.productID ?? row.productId;
+            if (pid == null) continue;
+            const key = String(pid);
+            if (map.has(key)) continue;
+            map.set(key, {
+              productID: key,
+              description: typeof row.description === "string" ? row.description : undefined,
+              unitOfMeasure: typeof row.unitOfMeasure === "string" ? row.unitOfMeasure : undefined,
+            });
+          }
+          const pagination = data.paginationData as { totalCount?: number } | undefined;
+          if (pagination?.totalCount != null) {
+            if (page >= Math.ceil(pagination.totalCount / PRODUCT_CATALOG_PAGE_SIZE)) break;
+          } else if (rows.length === 0) {
+            break;
+          }
+        }
+        this.productCatalogCache = { at: Date.now(), catalog: map };
+        return map;
+      } finally {
+        this.productCatalogInFlight = undefined;
+      }
+    })();
+    return this.productCatalogInFlight;
   }
 
   async get(path: string, query: Record<string, unknown> = {}): Promise<TitanResponse> {
