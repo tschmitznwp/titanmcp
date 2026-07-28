@@ -2,9 +2,10 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { TitanClient } from "./titanClient.js";
 import { toolDefs, type ToolDef } from "./tools.js";
-import { aggregateToolDefs } from "./aggregates.js";
+import { aggregateToolDefs, type ToolContext } from "./aggregates.js";
+import type { OrderIndex } from "./orderIndex.js";
 
-export const SERVER_INFO = { name: "titan-mcp", version: "1.4.0" };
+export const SERVER_INFO = { name: "titan-mcp", version: "1.5.0" };
 
 function splitArgs(
   def: ToolDef,
@@ -26,7 +27,8 @@ function splitArgs(
   return { path, query };
 }
 
-export function buildServer(client: TitanClient): McpServer {
+export function buildServer(client: TitanClient, orderIndex: OrderIndex): McpServer {
+  const ctx: ToolContext = { client, orderIndex };
   const server = new McpServer(SERVER_INFO, {
     instructions:
       "Read-only access to the Titan 3000 ERP system: customers, vendors, products, " +
@@ -35,7 +37,15 @@ export function buildServer(client: TitanClient): McpServer {
       "List tools support paging via PageNumber/PageSize; responses include " +
       "paginationData when the API provides it. For totals over large transaction " +
       "sets (e.g. a customer's annual sales), prefer the summarize_* tools, which " +
-      "aggregate server-side and return only compact summary numbers.",
+      "aggregate server-side and return only compact summary numbers. " +
+      "SALES ORDER DATES: an order has an orderDate (when it was entered) and a " +
+      "separate bookedDate (when it was actually booked); they are often months or " +
+      "years apart. The Titan API can only filter on orderDate, so questions about " +
+      "what was BOOKED in a period must use list_booked_orders, or " +
+      "summarize_sales_orders with DateBasis=booked — never list_sales_orders or an " +
+      "OrderDate filter. Those booked-date tools report a coverage object; if it says " +
+      "basis=partialScan the answer may be incomplete and that caveat must be passed " +
+      "on to the user.",
   });
 
   for (const def of toolDefs) {
@@ -77,7 +87,7 @@ export function buildServer(client: TitanClient): McpServer {
       },
       async (args: Record<string, unknown>): Promise<CallToolResult> => {
         try {
-          const data = await def.handler(client, args ?? {});
+          const data = await def.handler(ctx, args ?? {});
           return {
             content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
           };

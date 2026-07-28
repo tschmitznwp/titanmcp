@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const EXPECTED_TOOL_COUNT = 35;
+const EXPECTED_TOOL_COUNT = 37;
 const PORT = 8599;
 
 const child = spawn(process.execPath, ["dist/index.js"], {
@@ -14,6 +14,7 @@ const child = spawn(process.execPath, ["dist/index.js"], {
     TITAN_APP_ID: "smoke-test",
     TITAN_API_KEY: "smoke-test",
     TITAN_MCP_PORT: String(PORT),
+    TITAN_ORDER_INDEX: "false",
   },
   stdio: ["ignore", "ignore", "pipe"],
 });

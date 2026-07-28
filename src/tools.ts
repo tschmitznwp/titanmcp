@@ -253,7 +253,11 @@ export const toolDefs: ToolDef[] = [
     name: "list_sales_orders",
     title: "List sales orders",
     description:
-      "Retrieves sales orders, filtered by order date, customer, shipping location, job status, start/completed dates, reference, or quote. Sortable via SortBy.",
+      "Retrieves sales orders, filtered by order date, customer, shipping location, job status, " +
+      "start/completed dates, reference, or quote. Sortable via SortBy. NOTE: OrderDate is when " +
+      "the order was ENTERED, and these rows do not include bookedDate, bookedValue, plantId or " +
+      "customerId at all. For anything about orders BOOKED in a period, use list_booked_orders " +
+      "instead — this tool cannot answer that question.",
     path: "/api/v1/SalesOrders",
     params: {
       OrderDate: dateStr("Filter by order date"),

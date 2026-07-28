@@ -19,9 +19,43 @@ plus derived read-only summary tools; no write (POST/PUT/upload) operations are 
 | Production | `list_production_entries`, `get_production_entry` |
 | Lookups | `list_currencies`, `list_plants`, `list_regions`, `list_price_levels`, `list_tax_codes`, `list_terms`, `list_sales_reps`, `list_sales_order_types`, `list_po_styles`, `list_lines_of_business` |
 | Summaries | `summarize_sales_orders`, `summarize_invoices`, `summarize_production` — aggregate totals (with optional grouping) computed server-side so large transaction sets never reach the model |
+| Bookings | `list_booked_orders`, `get_order_index_status` — orders filtered by **`bookedDate`**, which the Titan API cannot filter on (see below) |
 
 List tools accept the API's filter parameters plus `PageNumber`/`PageSize`; responses
 include the API's `paginationData` when provided.
+
+## Booked-date queries
+
+A Titan sales order has two different dates, often months or years apart:
+
+- **`orderDate`** — when the order was entered. The only date the API can filter on.
+- **`bookedDate`** — when the order was actually booked. **No API filter exists for it**,
+  and it is not even returned by the `/SalesOrders` list endpoint — only by the
+  per-order `GET /SalesOrders/{jobNumber}`.
+
+Asking the API for "orders booked 19–25 July" is therefore impossible in one call:
+answering it means reading every sales order (57k+) individually. This server does
+that once in the background and keeps the result in memory:
+
+- `list_booked_orders` — the orders whose `bookedDate` is in a range, with each
+  order's booked value, customer, plant, rep and status, plus count and summed
+  `bookedValue` for the whole match.
+- `summarize_sales_orders` with `DateBasis=booked` + `BookedDateStart`/`BookedDateEnd`
+  — the same set as totals, groupable by month, customer, plant, rep or product.
+  `DateBasis=booked` **refuses** to run off `OrderDateStart`/`OrderDateEnd`, so a
+  booking question can't silently be answered with order-entry dates.
+- `get_order_index_status` — build state and progress.
+
+The index builds at startup (roughly 57k single-order fetches at
+`TITAN_ORDER_INDEX_CONCURRENCY` in parallel), refreshes incrementally every
+`TITAN_ORDER_INDEX_REFRESH_MINUTES`, and rebuilds fully every
+`TITAN_ORDER_INDEX_REBUILD_HOURS`. Set `TITAN_ORDER_INDEX_PATH` to a file on a
+mounted volume to survive restarts without re-scanning.
+
+Until the first build finishes, booked-date tools fall back to a bounded scan
+(orders entered within a year before the requested window) and mark the result
+`coverage.basis = "partialScan"` with an explicit `incompleteWarning`. Every
+response carries a `coverage` object — check it before treating a number as final.
 
 ## Configuration
 
@@ -33,7 +67,13 @@ All configuration is via environment variables (see `.env.example`):
 | `TITAN_APP_ID` | yes | Sent as the `X-App-Id` header |
 | `TITAN_API_KEY` | yes | Sent as the `X-Api-Key` header |
 | `TITAN_MCP_PORT` | no | HTTP port (default `8585`) |
-| `TITAN_EXCLUDED_PLANTS` | no | Comma-separated plant IDs excluded from the `summarize_*` tools (e.g. inactive plants) |
+| `TITAN_EXCLUDED_PLANTS` | no | Comma-separated plant IDs excluded from the `summarize_*` and booked-order tools (e.g. inactive plants) |
+| `TITAN_ORDER_INDEX` | no | `false` disables the booked-date index (default on) |
+| `TITAN_ORDER_INDEX_CONCURRENCY` | no | Parallel order fetches while indexing (default `12`) |
+| `TITAN_ORDER_INDEX_REFRESH_MINUTES` | no | Incremental refresh interval (default `15`) |
+| `TITAN_ORDER_INDEX_REBUILD_HOURS` | no | Full rebuild interval (default `24`) |
+| `TITAN_ORDER_INDEX_PATH` | no | File to persist the index to, so restarts skip the full scan (e.g. `/data/order-index.json`) |
+| `TITAN_ORDER_INDEX_MIN_ORDER_DATE` | no | `YYYY-MM-DD`; skip orders *entered* before this date to shrink the build. Responses then carry an `indexFloorNote` and `complete: false` |
 
 ## Running
 
@@ -43,12 +83,20 @@ A prebuilt image is published to GitHub Container Registry on every push to
 `main` (see `.github/workflows/docker.yml`):
 
 ```bash
+docker volume create titan-mcp-data
 docker run -d --name titan-mcp -p 8585:8585 \
+  -v titan-mcp-data:/data \
   -e TITAN_BASE_URL=http://titanapi-dev.nwpipe.com \
   -e TITAN_APP_ID=<your app id> \
   -e TITAN_API_KEY=<your api key> \
+  -e TITAN_ORDER_INDEX_PATH=/data/order-index.json \
   ghcr.io/tschmitznwp/titanmcp:latest
 ```
+
+The volume is what keeps the booked-date index across restarts; without it the
+container re-reads all ~58k orders every time it starts. Watch the first build
+with `docker logs -f titan-mcp` (lines tagged `[order-index]`), or poll
+`curl -s localhost:8585/healthz`.
 
 Or build it yourself:
 
