@@ -8,8 +8,9 @@ prompt's description* of the tool contract, without access to this repository (s
 its §6). This version reconciles it against the actual server, folds in findings
 from the live deployment on `rosie`, and records decisions taken since.
 
-**Last updated 2026-07-29 against v1.7.0 (`bbe7f7a`, `be66621`). All seven work
-items are shipped and verified against live data; what remains is listed in §7.**
+**Last updated 2026-07-29 against v1.8.1 (`7df6b43`, prompt `e38c715`). All seven
+work items are shipped and verified against live data; findings F-7 to F-9 came out
+of live testing afterwards. What remains is listed in §7.**
 
 ---
 
@@ -66,7 +67,7 @@ transports on every push.
 | WI-5 | `list_job_statuses` | **Shipped v1.7.0** | Derived from the index, with booked/unbooked splits and `jobTypes`; deliberately not plant-filtered |
 | WI-6 | Rules in tool descriptions | **Shipped v1.7.0**, extended in `be66621` | `summarize_invoices`/`list_invoices` prohibition added; see F-6 for the routing regression this class of change can cause |
 | WI-7 | Fail closed on partial coverage | **Shipped v1.7.0** | Gates on `coverage.complete === false` (not `basis`); `AllowPartial=true` escape hatch; error forbids the substitution detours by name |
-| F-1…F-6 | — | Findings not in the original review | **F-5 needs a decision**; F-1 has new context. See §4 |
+| F-1…F-9 | — | Findings not in the original review | **F-5 and F-8 need decisions**; F-9 is fixed but untested. See §4 |
 
 ### Verified against live data, 2026-07-29
 
@@ -260,7 +261,12 @@ size measures what bookings-based reporting misses. If the cliff is real, settin
 `TITAN_ORDER_INDEX_MIN_ORDER_DATE` to that year removes the structurally-unbookable
 history from every count, with the floor auto-disclosed in `scopeNote`.
 
-SQL against the source database answers this faster than adding a tool. *Owner: T.J.*
+**If direct database access is available**, SQL answers this faster than adding a
+tool. **If it is not** (Titan 3000 is a vendor ERP and the API may be the only
+supported route), the same analysis is fully derivable from the in-memory index at
+no API cost — every field needed is already stored. Roughly 30 lines: unbooked
+orders bucketed by order-entry year, by customer, and the earliest `bookedDate` on
+record. *Owner: T.J. — decide the route.*
 
 ### F-2 — `estimatedValue` is dead
 
@@ -323,6 +329,67 @@ grouped bookings by name.
 **Lesson for future WI-6-style work:** a description that asserts primacy for a
 *topic* will capture question shapes it should not. Scope assertions to the
 question shape the tool actually serves.
+
+### F-7 — Grouped results were returned unranked, so the model ranked them by hand
+
+`aggregate()` sorted groups by key. "Which products did we book the most dollars of
+last month" therefore returned ~300 product groups in alphabetical order, and the
+model answered by eyeballing the list, hand-transcribing ten candidates into the
+code interpreter, and sorting those. The top five it produced was correct — but only
+if it happened to spot every product above the cutoff while scanning 300 rows, and
+nothing verified that it had.
+
+The tool created the fabrication surface that the prompt's §1 rule exists to close.
+Fixed in v1.8.0: groups are ranked by value descending and capped by `TopGroups`
+(default 20), with `groupsNote` stating how many were omitted and that totals still
+cover all of them. `year`/`month` stay chronological and uncapped. Ranking field is
+per tool: `bookedValue`, `sellValue`, invoice `total`, production `yards`.
+
+**Generalizable:** if a response makes the caller do arithmetic or ordering to
+answer the question asked, the tool is the wrong shape — regardless of whether the
+numbers in it are right.
+
+### F-8 — Freight and other charges outrank real products — DECISION NEEDED
+
+June's product breakdown ranked `FREIGHT` first at **$488,374**, ahead of every
+manufactured item. `FS` (fuel surcharge, $18,693), `FREIGHTBOOM` ($15,790) and
+`COATING` are also charges, and `QN` ("QUOTE NOTES:") and `SN` ("STRUCTURE NOTE:")
+are annotation lines carrying $0.
+
+Answering "which *products* did we book the most of" with freight at the top is
+misleading even though the arithmetic is right.
+
+v1.8.0 carries `type`, `partTypeID` and `productLine` through the catalog and
+returns them from `search_products`, so charges can be identified by rule rather
+than by hardcoded ID. The prompt requires calling them out. **Whether charges
+should be excluded from product rankings by default is a business decision —
+with T.J., referred to the business 2026-07-29.**
+
+### F-9 — Reformatting re-derived metadata and mislabeled the period
+
+Asked to "put that in a clean executive summary table — keep it tight", the agent
+re-rendered June's booked figures under a **July 2026** heading, and captioned the
+retyped range "(server-resolved)" when the server had resolved June. Same numbers,
+wrong period, borrowed authority. In the same turn, `CUSTOM BOX BASE 6' X 6' X 6'`
+became "Custom box base" and `60 IN X 3 FT` became `60″ × 3 ft`.
+
+The existing rule covered regenerating data when *challenged*; it did not cover
+regenerating it when asked to make it prettier. Prompt section 3a (`e38c715`) now
+requires `dateBasis`, `resolvedRange`, scope notes and names to carry across
+verbatim, and a re-run when the source result is no longer visible. **Untested
+until the prompt is pasted into Open WebUI.**
+
+Two related behaviours from the same run, also addressed prompt-side: expanding
+opaque codes (`productLine: "BC"` reported as "BC (Bearing/Connection)") and
+narrating what a product is with no tool basis.
+
+**Correction worth recording:** an earlier finding in this session alleged that the
+product name "CAST IRON MISC. CUSTOM STRUCTURE" for `CIMC` was fabricated. It was
+not — `displayNameSource: "catalog"` confirms it is the catalog's own
+`productName`. Before v1.8.0 the catalog field was being read under the wrong name,
+so only the order-line description was visible and the correct name looked invented.
+Check provenance fields before alleging fabrication; a name that looks too tidy may
+simply be the one on file.
 
 ---
 
@@ -400,7 +467,9 @@ question shape the tool actually serves.
 | Open item | Owner |
 |---|---|
 | **F-5** — exclude Cancelled/Delete/Not Accepted from booked totals? | T.J. (reporting decision) |
-| **F-1** — `bookedValue: 0`, and the 9,146 Completed-without-`bookedDate` dig | T.J. (source data / SQL) |
+| **F-8** — exclude freight and other charges from product rankings? | Business (referred 2026-07-29) |
+| **F-9** — verify the reformatting fix once the prompt is pasted | T.J. (test), then closed |
+| **F-1** — `bookedValue: 0`, and the 9,146 Completed-without-`bookedDate` dig | T.J. — **needs a tool if direct DB access is unavailable** |
 | **Q1** — fiscal vs. calendar was answered; nothing outstanding | — |
 | **Q2** — does "bid value" map to the empty `estimatedValue`? If so, strike it from the prompt | T.J. |
 | **Q3** — define backlog before building it; `percentComplete` is detail-only and costs a rebuild | T.J. |
