@@ -157,7 +157,21 @@ function catalogFields(hit: CatalogProduct | undefined) {
 }
 
 function resolveProduct(productID: string, catalog: ProductCatalog | undefined) {
-  return { productID, ...catalogFields(catalog?.get(productID)) };
+  const hit = catalog?.get(productID);
+  const displayName = hit?.productName ?? null;
+  return {
+    productID,
+    ...catalogFields(hit),
+    displayName,
+    displayNameSource: displayName != null ? "catalog" : null,
+    ...(displayName == null
+      ? {
+          displayNameNote:
+            "No name exists for this product in Titan. Present the product code alone — do NOT " +
+            "infer, expand, or invent a name from the letters in the code.",
+        }
+      : {}),
+  };
 }
 
 function enrichProductGroups(
@@ -168,7 +182,27 @@ function enrichProductGroups(
   return groups.map((g) => {
     const productID = g.product;
     if (typeof productID !== "string") return g;
-    return { ...g, ...catalogFields(catalog.get(productID)) };
+    const hit = catalog.get(productID);
+    // One unambiguous field to quote. With a catalog name, a line description and
+    // a bare code all in play, the model picked none of them and expanded the code
+    // instead ("CIMC" -> "Cast Iron Misc. Custom Structure", which is not the
+    // product). displayName removes the choice.
+    const lineName = typeof g.name === "string" && g.name !== "" ? g.name : null;
+    const catalogName = hit?.productName ?? null;
+    const displayName = catalogName ?? lineName;
+    return {
+      ...g,
+      ...catalogFields(hit),
+      displayName,
+      displayNameSource: catalogName != null ? "catalog" : lineName != null ? "orderLine" : null,
+      ...(displayName == null
+        ? {
+            displayNameNote:
+              "No name exists for this product in Titan. Present the product code alone — do " +
+              "NOT infer, expand, or invent a name from the letters in the code.",
+          }
+        : {}),
+    };
   });
 }
 
@@ -1036,8 +1070,11 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "explicitly asks about when orders were ENTERED; the two give very different numbers, and " +
       "the Titan API has no bookedDate filter of its own (this server maintains an index for " +
       "it). Use Period (e.g. lastWeek, lastMonth, ytd) instead of computing dates yourself; the " +
-      "server resolves it and reports the absolute range in resolvedRange. GroupBy product (or " +
-      "a ProductID filter) switches to " +
+      "server resolves it and reports the absolute range in resolvedRange. " +
+      "PRODUCT NAMES: each product group carries displayName — reproduce it EXACTLY as given, " +
+      "including dimensions and punctuation. Never expand a product code into words, never " +
+      "shorten a description, and when displayName is null present the code alone. GroupBy " +
+      "product (or a ProductID filter) switches to " +
       "order DETAIL LINES and sums sellValue (quantityOrdered x sellUnitPrice), quantityOrdered, " +
       "and yards per product - use that for questions like which products sold the most in " +
       "dollars. When grouped by product each group is enriched with productName (from the Titan " +

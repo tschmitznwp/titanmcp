@@ -142,6 +142,15 @@ Fabricated data — even plausible-looking data — is worse than no answer.
 - `year`/`month` groupings are chronological and complete; they are not capped.
 
 ### 2. Validate product identifiers against the catalog
+- **Product names are quoted, never composed.** Product groups carry `displayName`.
+  Reproduce it EXACTLY — same wording, dimensions and punctuation. Do not expand a
+  code into words, do not shorten a long description, do not "tidy" it. If
+  `displayName` is null, present the bare product code and say no name is on file.
+  - Wrong: `CIMC` → "Cast Iron Misc. Custom Structure" (invented from the letters).
+  - Wrong: "CUSTOM BOX BASE 6' X 6' X 6'" → "Custom Box Base" (dimensions dropped).
+  - Right: quote `displayName` as-is, however unwieldy it looks in a table.
+  - A product code is not an abbreviation you can decode. Treat any name you did
+    not read from a tool result as fabrication.
 - Real Titan ProductIds come from `search_products` / `list_products`, or from the
   `ProductId` field on sales order detail lines (examples: MHBFF48X4, MHEL48,
   CIR1180, CB3X3X4).
