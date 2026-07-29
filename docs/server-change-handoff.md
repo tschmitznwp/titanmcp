@@ -5,8 +5,11 @@
 **Origin:** Consistency review of the Titan Reporting assistant system prompt
 **Status of this document:** the original review was written against the *system
 prompt's description* of the tool contract, without access to this repository (see
-its §6). This version reconciles it against the actual server at **v1.5.0**, folds in
-findings from the live deployment on `rosie`, and records decisions taken since.
+its §6). This version reconciles it against the actual server, folds in findings
+from the live deployment on `rosie`, and records decisions taken since.
+
+**Last updated 2026-07-29 against v1.7.0 (`bbe7f7a`, `be66621`). All seven work
+items are shipped and verified against live data; what remains is listed in §7.**
 
 ---
 
@@ -50,16 +53,31 @@ none of that. This cost one debugging cycle already; consider pointing OWUI at
 
 ## 2. Status summary
 
-| Item | Original ask | Actual state at v1.5.0 | Remaining |
+**All seven work items are shipped as of v1.7.0** (`bbe7f7a`, plus `be66621`). CI
+verifies compilation, swagger coverage, period fixtures, and 41 tools over both
+transports on every push.
+
+| Item | Original ask | Status | Notes |
 |---|---|---|---|
-| WI-1 | `DateBasis` required | Optional; infers `booked` when a booked range is passed | **Revised (D-5):** default to `booked`, not required |
-| WI-2 | Self-describing responses | ~60% shipped (`dateBasis`, `filters`, `coverage`) | `dateField`, `resolvedRange`, `measureFields`, `measureNote` |
-| WI-3 | Server-side `Period` | Not started | Blocked on fiscal year **and timezone** |
-| WI-4 | Customer lookup by name | Not possible as passthrough — API has no name filter | Build as cached in-process search |
-| WI-5 | `list_job_statuses` | No such API endpoint exists | Derive from the index instead |
-| WI-6 | Rules in tool descriptions | Mostly shipped | `summarize_invoices` / `list_invoices` only |
-| WI-7 | Fail closed on partial coverage | Not started | Small, with three precisions below |
-| F-1…F-4 | — | New findings, not in the original | See §4 |
+| WI-1 | `DateBasis` required | **Shipped v1.7.0** — as D-5, defaults to `booked` rather than being required | Order-entry dates without `DateBasis=order` now error naming both exits; unbounded booked queries allowed |
+| WI-2 | Self-describing responses | **Shipped v1.7.0** | `dateBasis`, `dateField`, `resolvedRange`, `measureFields`, `measureNote` on all four derived tools; D-2 coverage/scope split; D-3 `estimatedValue` omission |
+| WI-3 | Server-side `Period` | **Shipped v1.7.0** | 13 periods; America/Denver, calendar year, Sun–Sat weeks; `get_server_time`; fixtures in `scripts/verify-periods.mjs`, run by `npm run verify` |
+| WI-4 | Customer lookup by name | **Shipped v1.7.0** as `search_customers` + `search_products` | Cached catalogs (1,843 customers, ~4 requests); matching folds case and punctuation |
+| WI-5 | `list_job_statuses` | **Shipped v1.7.0** | Derived from the index, with booked/unbooked splits and `jobTypes`; deliberately not plant-filtered |
+| WI-6 | Rules in tool descriptions | **Shipped v1.7.0**, extended in `be66621` | `summarize_invoices`/`list_invoices` prohibition added; see F-6 for the routing regression this class of change can cause |
+| WI-7 | Fail closed on partial coverage | **Shipped v1.7.0** | Gates on `coverage.complete === false` (not `basis`); `AllowPartial=true` escape hatch; error forbids the substitution detours by name |
+| F-1…F-6 | — | Findings not in the original review | **F-5 needs a decision**; F-1 has new context. See §4 |
+
+### Verified against live data, 2026-07-29
+
+- Booked 2026-07-19→25: **32 orders, $462,581.25**. St. George alone: 11 orders,
+  $149,847.07.
+- The *same seven days* by entry date: **88 orders, $325,243.36** — a different
+  population and different money. The original defect, quantified.
+- Index: 57,892 orders, 0 failures, 163 s cold build, restores from disk on restart.
+- Confirmed working through Open WebUI: booked-basis routing, period resolution,
+  scope disclosure, `search_customers`, `list_job_statuses`, refusal to invent a
+  customer, and invoice/booking separation.
 
 ---
 
@@ -223,6 +241,27 @@ document exists to enforce.
 `ordersWithZeroBookedValue` (count) on booked responses, so the agent can disclose how
 much of a total is affected. Harmless once the data is fixed. *Awaiting decision.*
 
+**Related, and larger: 9,146 Completed orders have no `bookedDate` at all** — 32% of
+all Completed (from the WI-5 crosstab). T.J.'s working hypotheses, 2026-07-29:
+
+1. **Pre-implementation orders**, entered before `bookedDate` existed. Structural,
+   nothing to fix — but historical bookings trends will look like a collapse if
+   nobody knows the cutoff.
+2. **Will-call / counter sales** that never pass through a booking workflow. Far more
+   consequential: bookings-based reporting would exclude that revenue permanently, by
+   design rather than by defect.
+
+Evidence cuts against (2) being the whole story — two of the three orders sampled
+from 2026-07-19→25 were cash-account customers and *did* carry booked dates.
+
+Both hypotheses separate with one query: **unbooked orders by order-entry year**.
+A cliff is the implementation date; a steady residual after it is will-call, and its
+size measures what bookings-based reporting misses. If the cliff is real, setting
+`TITAN_ORDER_INDEX_MIN_ORDER_DATE` to that year removes the structurally-unbookable
+history from every count, with the floor auto-disclosed in `scopeNote`.
+
+SQL against the source database answers this faster than adding a tool. *Owner: T.J.*
+
 ### F-2 — `estimatedValue` is dead
 
 Zero on every row observed, `null` in raw payloads. Currently summed and reported,
@@ -242,7 +281,48 @@ a company-wide number.
 
 ### F-4 — Timezone
 
-Folded into WI-3 above.
+Resolved: America/Denver, hardcoded in `src/periods.ts` (WI-3, shipped).
+
+### F-5 — Cancelled and deleted orders are counted as bookings — DECISION NEEDED
+
+`list_job_statuses` against live data shows that statuses which sound unbooked
+nonetheless carry a `bookedDate`:
+
+| jobStatus | booked | total |
+|---|---:|---:|
+| Cancelled | 410 | 2,079 |
+| Not Accepted | 262 | 13,812 |
+| Quote | 108 | 10,460 |
+| Delete | 104 | 1,706 |
+| Budget Quote | 2 | 409 |
+
+That is ~886 orders in dead statuses, ~4% of the 20,994 booked. **No status filter
+is applied by default**, so `list_booked_orders` and every booked total currently
+include cancelled and deleted orders.
+
+The decision is a reporting one, not a defect: should the booked tools exclude
+Cancelled / Delete / Not Accepted by default (disclosed in `coverage.scopeNote`,
+with a parameter to include them for reconciliation)? A cancelled order is not a
+booking — but "booked, then cancelled" may still belong in a bookings report
+depending on how NWPX reports churn. **Owner: T.J.**
+
+### F-6 — Tool descriptions can misroute as easily as they can route
+
+`list_booked_orders` shipped described as "THIS IS THE TOOL FOR 'orders booked in
+&lt;period&gt;'". That was emphatic enough to win *aggregate* booked questions too, so
+"which products did we book the most of last month" became: list 200 orders, then
+reason over them, sometimes fetching detail lines per job. Slow, and the wrong
+shape entirely.
+
+The system prompt already said totals must use a `summarize_*` tool. The tool
+description was more specific and sat closer to the decision, so it won — the same
+mechanism WI-6 relies on, pointed the wrong way. Fixed in `be66621` by scoping the
+listing tool to listings and having `summarize_sales_orders` claim ranked and
+grouped bookings by name.
+
+**Lesson for future WI-6-style work:** a description that asserts primacy for a
+*topic* will capture question shapes it should not. Scope assertions to the
+question shape the tool actually serves.
 
 ---
 
@@ -267,8 +347,10 @@ Folded into WI-3 above.
   `completedDate`, `jobStatus`, so booked-minus-delivered is plausibly derivable, but
   it depends on whether invoices carry a job reference. Worth a spike before promising
   it.
-- **Q5 — quotes / unbooked pipeline carry no `bookedDate`.** Consistent with
-  everything observed, not yet proven. Settled in one query by the WI-5 crosstab.
+- **Q5 — do quotes / unbooked orders carry no `bookedDate`? ANSWERED: NO, the
+  assumption was false.** The WI-5 crosstab shows Quote (108), Not Accepted (262),
+  Cancelled (410) and Delete (104) orders all carrying booked dates. They are
+  therefore present in booked results today — see F-5, which needs a decision.
 
 ---
 
@@ -304,22 +386,38 @@ Folded into WI-3 above.
 
 ---
 
-## 7. Sequencing
+## 7. Sequencing — complete
 
 1. ~~`bookedValue: 0` root cause~~ → F-1, owned by the source DB.
-2. **WI-2 delta + D-2 coverage split + D-3.** Small.
-3. **WI-1**, prompt first, then server. Small.
-4. **WI-3**, once fiscal year *and* timezone are answered.
-5. **WI-4 / WI-5** via the cached-catalog and index patterns. New tools → mcpo restart.
-6. **WI-6 delta + WI-7.** Small.
+2. ~~WI-2 delta + D-2 coverage split + D-3~~ → shipped v1.6.0.
+3. ~~WI-1 / D-5~~ → shipped v1.7.0.
+4. ~~WI-3~~ → shipped v1.7.0 (America/Denver, calendar year).
+5. ~~WI-4 / WI-5~~ → shipped v1.7.0.
+6. ~~WI-6 delta + WI-7~~ → shipped v1.6.0, extended `be66621`.
 
-Items 2, 3 and 6 touch `src/aggregates.ts` mostly, with small changes to
-`src/orderIndex.ts` for the coverage/scope split, plus `docs/owui-system-prompt.md`,
-`README.md`, a version bump to 1.6.0, and a smoke assertion that a missing
-`DateBasis` errors. No new tools, so the tool count stays 37 and mcpo needs no
-restart — OWUI still needs the prompt re-pasted for WI-1.
+### What remains, and who owns it
 
-Work on a branch and open a PR rather than editing the running server in place.
+| Open item | Owner |
+|---|---|
+| **F-5** — exclude Cancelled/Delete/Not Accepted from booked totals? | T.J. (reporting decision) |
+| **F-1** — `bookedValue: 0`, and the 9,146 Completed-without-`bookedDate` dig | T.J. (source data / SQL) |
+| **Q1** — fiscal vs. calendar was answered; nothing outstanding | — |
+| **Q2** — does "bid value" map to the empty `estimatedValue`? If so, strike it from the prompt | T.J. |
+| **Q3** — define backlog before building it; `percentComplete` is detail-only and costs a rebuild | T.J. |
+| `ordersWithZeroBookedValue` reporting while F-1 data is cleaned | awaiting decision |
+
+### Deployment note (learned the hard way)
+
+Open WebUI reaches this server through the `mcpo-pts` bridge, which builds its route
+table at startup. **New tools require `docker restart mcpo-pts`, an OWUI connection
+re-save, and a new chat** before the model can see them — changes to existing tools
+need none of that. A release that adds tools and one that only changes descriptions
+have very different deployment costs. Pointing OWUI at `http://titan-mcp:8585/mcp`
+natively (OWUI ≥ 0.6.31) would remove this class of problem.
+
+Prompt edits land *before* the container swap: the prompt works against both
+versions, so early is safe and late leaves a window where it describes behavior the
+server no longer has.
 
 ---
 
