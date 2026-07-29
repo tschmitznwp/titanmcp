@@ -1,5 +1,10 @@
 import { z, type ZodRawShape } from "zod";
-import type { CatalogCustomer, ProductCatalog, TitanClient } from "./titanClient.js";
+import type {
+  CatalogCustomer,
+  CatalogProduct,
+  ProductCatalog,
+  TitanClient,
+} from "./titanClient.js";
 import type { OrderIndex, OrderIndexEntry } from "./orderIndex.js";
 import {
   PERIOD_NAMES,
@@ -139,14 +144,20 @@ async function tryGetProductCatalog(client: TitanClient): Promise<ProductCatalog
   }
 }
 
-function resolveProduct(productID: string, catalog: ProductCatalog | undefined) {
-  const hit = catalog?.get(productID);
+/** Catalog fields worth carrying alongside a product ID, when the catalog has them. */
+function catalogFields(hit: CatalogProduct | undefined) {
   return {
-    productID,
-    productName: hit?.description ?? null,
+    productName: hit?.productName ?? null,
     resolved: hit != null,
     ...(hit?.unitOfMeasure ? { unitOfMeasure: hit.unitOfMeasure } : {}),
+    ...(hit?.type ? { type: hit.type } : {}),
+    ...(hit?.partTypeID ? { partTypeID: hit.partTypeID } : {}),
+    ...(hit?.productLine ? { productLine: hit.productLine } : {}),
   };
+}
+
+function resolveProduct(productID: string, catalog: ProductCatalog | undefined) {
+  return { productID, ...catalogFields(catalog?.get(productID)) };
 }
 
 function enrichProductGroups(
@@ -157,13 +168,7 @@ function enrichProductGroups(
   return groups.map((g) => {
     const productID = g.product;
     if (typeof productID !== "string") return g;
-    const hit = catalog.get(productID);
-    return {
-      ...g,
-      productName: hit?.description ?? null,
-      resolved: hit != null,
-      ...(hit?.unitOfMeasure ? { unitOfMeasure: hit.unitOfMeasure } : {}),
-    };
+    return { ...g, ...catalogFields(catalog.get(productID)) };
   });
 }
 
@@ -199,16 +204,29 @@ const groupSpecs: Record<string, GroupSpec> = {
   department: { key: (row) => String(row.productionDepartment ?? "unknown") },
 };
 
+/** Groupings where chronological order beats ranking, and a "top N" makes no sense. */
+const CHRONOLOGICAL_GROUPS = new Set(["year", "month"]);
+
+interface AggregateOptions {
+  groupBy?: string;
+  /** Field the groups are ranked by; defaults to the first sum field. */
+  rankBy?: string;
+  /** Cap on ranked groups returned. Ignored for chronological groupings. */
+  topGroups?: number;
+}
+
 function aggregate(
   rows: Record<string, unknown>[],
   sumFields: string[],
   dateField: string,
-  groupBy?: string
+  options: AggregateOptions = {}
 ): {
   count: number;
   totals: Record<string, number>;
   groups?: Record<string, unknown>[];
 } {
+  const { groupBy, topGroups } = options;
+  const rankBy = options.rankBy ?? sumFields[0];
   const totals: Record<string, number> = Object.fromEntries(sumFields.map((f) => [f, 0]));
   for (const row of rows) {
     for (const f of sumFields) totals[f] += toNumber(row[f]);
@@ -234,14 +252,43 @@ function aggregate(
       bucket.count++;
       for (const f of sumFields) bucket.sums[f] += toNumber(row[f]);
     }
-    result.groups = [...byKey.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, bucket]) => ({
-        [groupBy!]: key,
-        ...(bucket.label !== undefined ? { name: bucket.label } : {}),
-        count: bucket.count,
-        ...Object.fromEntries(sumFields.map((f) => [f, round2(bucket.sums[f])])),
-      }));
+    // Ranked by value for categorical groupings — an alphabetical dump of 300
+    // products forces the caller to scan and hand-pick, which is where wrong
+    // "top 5" answers come from. Chronological groupings stay in date order.
+    const chronological = CHRONOLOGICAL_GROUPS.has(groupBy!);
+    const entries = [...byKey.entries()];
+    if (chronological) {
+      entries.sort(([a], [b]) => a.localeCompare(b));
+    } else {
+      entries.sort(
+        (a, b) => (b[1].sums[rankBy] ?? 0) - (a[1].sums[rankBy] ?? 0) || a[0].localeCompare(b[0])
+      );
+    }
+
+    const capped =
+      !chronological && topGroups != null && entries.length > topGroups
+        ? entries.slice(0, topGroups)
+        : entries;
+
+    result.groups = capped.map(([key, bucket]) => ({
+      [groupBy!]: key,
+      ...(bucket.label !== undefined ? { name: bucket.label } : {}),
+      count: bucket.count,
+      ...Object.fromEntries(sumFields.map((f) => [f, round2(bucket.sums[f])])),
+    }));
+
+    if (capped.length < entries.length) {
+      Object.assign(result, {
+        groupsReturned: capped.length,
+        groupsTotal: entries.length,
+        groupsNote:
+          `Showing the top ${capped.length} of ${entries.length} groups, ranked by ${rankBy} ` +
+          "descending. The count and totals above cover ALL groups, not just these — raise " +
+          "TopGroups to see more. Do not re-rank these rows yourself; they are already ordered.",
+      });
+    } else if (!chronological) {
+      Object.assign(result, { groupsRankedBy: `${rankBy} descending` });
+    }
   }
   return result;
 }
@@ -525,6 +572,25 @@ export interface AggregateToolDef {
 const groupByParam = (values: [string, ...string[]], hint: string) =>
   z.enum(values).optional().describe(`Optional grouping for subtotals: ${hint}.`);
 
+const DEFAULT_TOP_GROUPS = 20;
+
+const topGroupsParam = () =>
+  z
+    .number()
+    .int()
+    .min(1)
+    .max(1000)
+    .optional()
+    .describe(
+      `Maximum groups returned when grouping by a category (default ${DEFAULT_TOP_GROUPS}). ` +
+        "Groups come back already ranked by value, highest first, so this is a top-N — use it " +
+        "for 'which N did we X the most of'. Ignored for year/month, which stay chronological " +
+        "and complete. Counts and totals always cover ALL groups."
+    );
+
+const topGroupsArg = (args: Record<string, unknown>): number =>
+  args.TopGroups == null ? DEFAULT_TOP_GROUPS : Number(args.TopGroups);
+
 /** Fold case and punctuation so "AAA Construction Inc" matches "AAA Construction, Inc.". */
 function normalizeForSearch(value: unknown): string {
   return String(value ?? "")
@@ -795,10 +861,12 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     name: "search_products",
     title: "Search products by name or ID",
     description:
-      "Finds products by description or product ID and returns real Titan ProductIds for use as " +
-      "filter values. The Titan API has no name/description filter, so this searches the cached " +
-      "product catalog. Use this to ground a product before quoting figures for it, and never " +
-      "invent a ProductId. Matching ignores case and punctuation.",
+      "Finds products by name or product ID and returns real Titan ProductIds for use as filter " +
+      "values, along with type, partTypeID and productLine — which distinguish manufactured " +
+      "goods from charges such as freight, fuel surcharge and quote notes. The Titan API has no " +
+      "name filter, so this searches the cached product catalog. Use it to ground a product " +
+      "before quoting figures for it, and never invent a ProductId. Matching ignores case and " +
+      "punctuation.",
     params: {
       Query: z.string().describe("Product description (full or partial) or product ID."),
       Limit: z
@@ -815,9 +883,9 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       const needle = normalizeForSearch(query);
       const catalog = await ctx.client.getProductCatalog();
 
-      const scored: { rank: number; product: { productID: string; description?: string; unitOfMeasure?: string } }[] = [];
+      const scored: { rank: number; product: CatalogProduct }[] = [];
       for (const product of catalog.values()) {
-        const byName = matchRank(normalizeForSearch(product.description), needle);
+        const byName = matchRank(normalizeForSearch(product.productName), needle);
         const byId = matchRank(normalizeForSearch(product.productID), needle);
         const rank = Math.min(byName ?? 99, byId ?? 99);
         if (rank < 99) scored.push({ rank, product });
@@ -829,8 +897,12 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       const limit = Math.min(Number(args.Limit ?? 25), 200);
       const matches = scored.slice(0, limit).map(({ product }) => ({
         productId: product.productID,
-        description: product.description ?? null,
+        productName: product.productName ?? null,
         unitOfMeasure: product.unitOfMeasure ?? null,
+        type: product.type ?? null,
+        partTypeID: product.partTypeID ?? null,
+        productLine: product.productLine ?? null,
+        status: product.status ?? null,
       }));
 
       return {
@@ -956,7 +1028,9 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "totals, e.g. a customer's annual sales. THIS IS THE TOOL for 'which products / customers " +
       "/ plants / reps did we book the most of', 'how much did we book', and any ranked or " +
       "grouped bookings figure — use it rather than listing orders with list_booked_orders and " +
-      "adding them up yourself. DATE BASIS: defaults to BOOKED (bookedDate), " +
+      "adding them up yourself. Grouped results come back ALREADY RANKED by value, highest " +
+      "first, capped by TopGroups: read them in order and do not re-sort or re-rank them " +
+      "yourself. DATE BASIS: defaults to BOOKED (bookedDate), " +
       "which is what 'sales', 'bookings' and 'sold' mean — pass BookedDateStart/BookedDateEnd or " +
       "Period. Pass DateBasis=order with OrderDateStart/OrderDateEnd only when the user " +
       "explicitly asks about when orders were ENTERED; the two give very different numbers, and " +
@@ -1009,6 +1083,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         "year, month, customer, plant, jobStatus, salesRep, jobType, or product (product " +
           "switches to detail-line sums)"
       ),
+      TopGroups: topGroupsParam(),
     },
     handler: async (ctx, args) => {
       // D-5: booked is the default basis — "sales" means booked at NWPX, so an
@@ -1162,7 +1237,11 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           );
         }
         const effectiveGroupBy = (args.GroupBy as string) ?? "product";
-        const agg = aggregate(lines, ["sellValue", "quantityOrdered", "yards"], dateField, effectiveGroupBy);
+        const agg = aggregate(lines, ["sellValue", "quantityOrdered", "yards"], dateField, {
+          groupBy: effectiveGroupBy,
+          rankBy: "sellValue",
+          topGroups: topGroupsArg(args),
+        });
         return {
           ...base,
           measure:
@@ -1193,12 +1272,11 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           ? { measureNote: orderBasisNote("bookedValue (booked dollars)") }
           : {}),
         ...(withEstimated || orders.length === 0 ? {} : ESTIMATED_VALUE_OMITTED_NOTE),
-        ...aggregate(
-          orders as unknown as Record<string, unknown>[],
-          orderSumFields,
-          dateField,
-          args.GroupBy as string
-        ),
+        ...aggregate(orders as unknown as Record<string, unknown>[], orderSumFields, dateField, {
+          groupBy: args.GroupBy as string,
+          rankBy: "bookedValue",
+          topGroups: topGroupsArg(args),
+        }),
       };
     },
   },
@@ -1228,6 +1306,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         ["year", "month", "plant", "product", "department"],
         "year, month, plant, product, or department"
       ),
+      TopGroups: topGroupsParam(),
     },
     handler: async (ctx, args) => {
       const client = ctx.client;
@@ -1322,12 +1401,12 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         const wanted = String(args.ProductID).toUpperCase();
         lines = lines.filter((line) => String(line.productID ?? "").toUpperCase() === wanted);
       }
-      const agg = aggregate(
-        lines,
-        ["quantity", "quantityProd", "yards", "cubicMeters", "tons"],
-        "date",
-        args.GroupBy as string
-      );
+      const agg = aggregate(lines, ["quantity", "quantityProd", "yards", "cubicMeters", "tons"], "date", {
+        groupBy: args.GroupBy as string,
+        // NWPX reports production volume in yards unless asked otherwise.
+        rankBy: "yards",
+        topGroups: topGroupsArg(args),
+      });
       const catalogUsed = args.GroupBy === "product" || args.ProductID != null;
       return {
         ...base,
@@ -1364,6 +1443,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         ["year", "month", "customer", "plant", "salesRep"],
         "year, month, customer, plant, or salesRep"
       ),
+      TopGroups: topGroupsParam(),
     },
     handler: async (ctx, args) => {
       const client = ctx.client;
@@ -1414,7 +1494,11 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         pagesFetched,
         ...(truncated ? { warning: `Result truncated after ${MAX_PAGES} pages; totals are incomplete. Narrow the filters.` } : {}),
         ...skippedNote(skipped),
-        ...aggregate(kept, ["subtotal", "tax", "total"], "invoiceDate", args.GroupBy as string),
+        ...aggregate(kept, ["subtotal", "tax", "total"], "invoiceDate", {
+          groupBy: args.GroupBy as string,
+          rankBy: "total",
+          topGroups: topGroupsArg(args),
+        }),
       };
     },
   },

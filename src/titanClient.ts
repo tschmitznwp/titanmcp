@@ -20,10 +20,19 @@ export interface TitanResponse {
   paginationData?: unknown;
 }
 
+// Field names verified against a live /Products row (2026-07-29): the description
+// lives in `productName` and the unit in `uom` — NOT `description`/`unitOfMeasure`,
+// which is why every enriched group reported productName: null while claiming
+// resolved: true. type/partTypeID/productLine are carried so charges (freight, fuel
+// surcharge, quote notes) can be told apart from manufactured goods.
 export interface CatalogProduct {
   productID: string;
-  description?: string;
+  productName?: string;
   unitOfMeasure?: string;
+  type?: string;
+  partTypeID?: string;
+  productLine?: string;
+  status?: string;
 }
 
 export type ProductCatalog = Map<string, CatalogProduct>;
@@ -86,10 +95,15 @@ export class TitanClient {
             if (pid == null) continue;
             const key = String(pid);
             if (map.has(key)) continue;
+            const str = (v: unknown) => (typeof v === "string" && v !== "" ? v : undefined);
             map.set(key, {
               productID: key,
-              description: typeof row.description === "string" ? row.description : undefined,
-              unitOfMeasure: typeof row.unitOfMeasure === "string" ? row.unitOfMeasure : undefined,
+              productName: str(row.productName),
+              unitOfMeasure: str(row.uom),
+              type: str(row.type),
+              partTypeID: str(row.partTypeID),
+              productLine: str(row.productLine),
+              status: str(row.status),
             });
           }
           const pagination = data.paginationData as { totalCount?: number } | undefined;

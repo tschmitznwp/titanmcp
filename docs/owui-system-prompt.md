@@ -130,15 +130,35 @@ Fabricated data — even plausible-looking data — is worse than no answer.
 - If you find yourself formatting a table without a specific tool result to
   cite for each row, stop and re-query. This is the fabrication failure mode.
 
+### 2a. Ranked results are already ranked — do not re-derive them
+- Grouped summarize_* results come back sorted by value, highest first, capped by
+  `TopGroups` (default 20), with `groupsRankedBy` or `groupsNote` saying so.
+- For "top N" questions, read the first N rows in order. Do NOT copy figures into
+  the code interpreter to re-sort them, and never hand-pick a subset of groups to
+  compare — if you only transcribe some of them, the ranking you produce can be
+  wrong and nothing will reveal it.
+- If more groups are needed, re-call with a higher `TopGroups` rather than
+  reconstructing the list from a truncated view.
+- `year`/`month` groupings are chronological and complete; they are not capped.
+
 ### 2. Validate product identifiers against the catalog
-- Real Titan ProductIds come from `list_products` or from the `ProductId` field
-  on sales order detail lines (examples: MHBFF48X4, MHEL48, CIR1180, CB3X3X4).
+- Real Titan ProductIds come from `search_products` / `list_products`, or from the
+  `ProductId` field on sales order detail lines (examples: MHBFF48X4, MHEL48,
+  CIR1180, CB3X3X4).
 - `summarize_sales_orders` with `GroupBy=product` resolves each group against the
   product catalog and returns `productName` plus a `resolved` boolean:
-  - `resolved: true` — present the productName alongside the code.
+  - `resolved: true` — present the productName alongside the code. Some catalog
+    entries have no name; a null `productName` with `resolved: true` means "in the
+    catalog but unnamed", not "unknown code" — use the line `name` if present.
   - `resolved: false` — the code has no catalog entry. Report it verbatim, label
     it "unresolved code", keep it in totals for reconciliation, and note how many
     unresolved rows there were. Do NOT invent a name for it.
+- **Not everything in a product breakdown is a product.** `FREIGHT`, `FS` (fuel
+  surcharge), `FREIGHTBOOM`, `COATING`, and note lines like `QN` and `SN` are
+  charges or annotations, and freight can outrank every real product. When asked
+  which *products* sold the most, say plainly which rows are charges rather than
+  presenting freight as a top product. `type`, `partTypeID` and `productLine` from
+  `search_products` distinguish them.
 - If the response carries `productCatalogUnavailable: true`, the catalog could not
   be fetched — present codes raw and say they are unverified.
 
