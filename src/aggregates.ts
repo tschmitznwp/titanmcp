@@ -546,15 +546,16 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     name: "list_booked_orders",
     title: "List orders booked in a period",
     description:
-      "Lists the individual sales orders whose bookedDate falls inside a date range, with each " +
-      "order's bookedDate, bookedValue, customer, plant, sales rep and status, plus the count " +
-      "and summed bookedValue for the whole match. THIS IS THE TOOL FOR 'orders booked in " +
-      "<period>' / 'what did we book last week' — the Titan API itself has NO bookedDate filter, " +
-      "and list_sales_orders/OrderDate filters on when the order was ENTERED, which is a " +
-      "different (usually much larger) set. Answers come from a background index of every sales " +
-      "order; if that index is still building, the tool falls back to a bounded scan and says so " +
-      "in coverage.incompleteWarning — repeat that caveat to the user rather than presenting " +
-      "partial results as complete.",
+      "LISTS INDIVIDUAL ORDERS booked in a date range — job numbers, customers, values, one-off " +
+      "drill-down — when the user wants to see the orders themselves. NOT for totals, rankings, " +
+      "or any breakdown: for 'how much did we book', 'which products/customers/plants did we " +
+      "book the most of', or anything grouped, use summarize_sales_orders with DateBasis=booked, " +
+      "which aggregates server-side instead of making you read rows. Filtering is on bookedDate " +
+      "(when the order was booked); the Titan API has no such filter and list_sales_orders/" +
+      "OrderDate filters on when the order was ENTERED, a different and usually much larger set. " +
+      "Answers come from a background index of every sales order; if it is still building the " +
+      "call errors rather than returning a partial result, unless AllowPartial=true. Returns the " +
+      "count and summed bookedValue for ALL matches regardless of how many rows are listed.",
     params: {
       BookedDateStart: z
         .string()
@@ -587,7 +588,10 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         .min(1)
         .max(2000)
         .optional()
-        .describe("Maximum order rows to return (default 200). Totals always cover ALL matches."),
+        .describe(
+          "Maximum order rows to return (default 200, max 2000). The count and totals always " +
+            "cover ALL matches, so the limit only affects how many rows are listed."
+        ),
       OrderDateStart: z
         .string()
         .optional()
@@ -949,7 +953,10 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "Aggregates sales orders (bookings) without returning individual orders: finds matching " +
       "orders, fetches their values, and returns counts and summed bookedValue/estimatedValue, " +
       "optionally grouped. Use this instead of list_sales_orders for questions about sales " +
-      "totals, e.g. a customer's annual sales. DATE BASIS: defaults to BOOKED (bookedDate), " +
+      "totals, e.g. a customer's annual sales. THIS IS THE TOOL for 'which products / customers " +
+      "/ plants / reps did we book the most of', 'how much did we book', and any ranked or " +
+      "grouped bookings figure — use it rather than listing orders with list_booked_orders and " +
+      "adding them up yourself. DATE BASIS: defaults to BOOKED (bookedDate), " +
       "which is what 'sales', 'bookings' and 'sold' mean — pass BookedDateStart/BookedDateEnd or " +
       "Period. Pass DateBasis=order with OrderDateStart/OrderDateEnd only when the user " +
       "explicitly asks about when orders were ENTERED; the two give very different numbers, and " +
