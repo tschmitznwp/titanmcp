@@ -28,6 +28,17 @@ export interface CatalogProduct {
 
 export type ProductCatalog = Map<string, CatalogProduct>;
 
+export interface CatalogCustomer {
+  customerID: string;
+  companyName?: string;
+  city?: string;
+  state?: string;
+  status?: string;
+  salesRep?: string;
+}
+
+export type CustomerCatalog = Map<string, CatalogCustomer>;
+
 const PRODUCT_CATALOG_TTL_MS = 30 * 60 * 1000;
 const PRODUCT_CATALOG_PAGE_SIZE = 500;
 const PRODUCT_CATALOG_MAX_PAGES = 200;
@@ -50,6 +61,8 @@ export class TitanClient {
 
   private productCatalogCache?: { at: number; catalog: ProductCatalog };
   private productCatalogInFlight?: Promise<ProductCatalog>;
+  private customerCatalogCache?: { at: number; catalog: CustomerCatalog };
+  private customerCatalogInFlight?: Promise<CustomerCatalog>;
 
   get excludedPlants(): Set<string> {
     return this.config.excludedPlants;
@@ -93,6 +106,56 @@ export class TitanClient {
       }
     })();
     return this.productCatalogInFlight;
+  }
+
+  /**
+   * The Titan API has no name filter on /Customers, so name lookup is served from
+   * a cached snapshot of the whole list. Unlike sales orders, the list rows are
+   * complete records, so this is ~4 requests for the 1,843 customers at NWPX — no
+   * per-record fetch, and only the search fields are retained.
+   */
+  async getCustomerCatalog(): Promise<CustomerCatalog> {
+    const cached = this.customerCatalogCache;
+    if (cached && Date.now() - cached.at < PRODUCT_CATALOG_TTL_MS) return cached.catalog;
+    if (this.customerCatalogInFlight) return this.customerCatalogInFlight;
+    this.customerCatalogInFlight = (async () => {
+      try {
+        const map: CustomerCatalog = new Map();
+        for (let page = 1; page <= PRODUCT_CATALOG_MAX_PAGES; page++) {
+          const data = await this.get("/api/v1/Customers", {
+            PageNumber: page,
+            PageSize: PRODUCT_CATALOG_PAGE_SIZE,
+          });
+          const rows = Array.isArray(data.result) ? (data.result as Record<string, unknown>[]) : [];
+          for (const row of rows) {
+            const id = row.customerID ?? row.customerId;
+            if (id == null) continue;
+            const key = String(id);
+            if (map.has(key)) continue;
+            const str = (v: unknown) => (typeof v === "string" && v !== "" ? v : undefined);
+            map.set(key, {
+              customerID: key,
+              companyName: str(row.companyName),
+              city: str(row.city),
+              state: str(row.state),
+              status: str(row.status),
+              salesRep: str(row.salesRep),
+            });
+          }
+          const pagination = data.paginationData as { totalCount?: number } | undefined;
+          if (pagination?.totalCount != null) {
+            if (page >= Math.ceil(pagination.totalCount / PRODUCT_CATALOG_PAGE_SIZE)) break;
+          } else if (rows.length === 0) {
+            break;
+          }
+        }
+        this.customerCatalogCache = { at: Date.now(), catalog: map };
+        return map;
+      } finally {
+        this.customerCatalogInFlight = undefined;
+      }
+    })();
+    return this.customerCatalogInFlight;
   }
 
   async get(path: string, query: Record<string, unknown> = {}): Promise<TitanResponse> {

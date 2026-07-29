@@ -20,6 +20,8 @@ plus derived read-only summary tools; no write (POST/PUT/upload) operations are 
 | Lookups | `list_currencies`, `list_plants`, `list_regions`, `list_price_levels`, `list_tax_codes`, `list_terms`, `list_sales_reps`, `list_sales_order_types`, `list_po_styles`, `list_lines_of_business` |
 | Summaries | `summarize_sales_orders`, `summarize_invoices`, `summarize_production` — aggregate totals (with optional grouping) computed server-side so large transaction sets never reach the model |
 | Bookings | `list_booked_orders`, `get_order_index_status` — orders filtered by **`bookedDate`**, which the Titan API cannot filter on (see below) |
+| Search | `search_customers`, `search_products` — name/ID lookup the API has no filter for, served from cached catalogs |
+| Reference | `list_job_statuses` (derived from indexed orders), `get_server_time` (server date + resolved periods) |
 
 List tools accept the API's filter parameters plus `PageNumber`/`PageSize`; responses
 include the API's `paginationData` when provided.
@@ -53,9 +55,44 @@ The index builds at startup (roughly 57k single-order fetches at
 mounted volume to survive restarts without re-scanning.
 
 Until the first build finishes, booked-date tools fall back to a bounded scan
-(orders entered within a year before the requested window) and mark the result
-`coverage.basis = "partialScan"` with an explicit `incompleteWarning`. Every
-response carries a `coverage` object — check it before treating a number as final.
+(orders entered within a year before the requested window). That result is
+incomplete, so it is returned as an **error** unless the caller passes
+`AllowPartial=true` — a partial answer cannot be silently formatted as a final one.
+
+Every summarize_* and booked-date response is self-describing: `dateBasis`,
+`dateField`, `resolvedRange` (the absolute dates applied), `measureFields`, and a
+`coverage` object. In `coverage`, `complete` means "answered from a fully-built
+index" — it is deliberately *not* affected by `TITAN_EXCLUDED_PLANTS` or
+`TITAN_ORDER_INDEX_MIN_ORDER_DATE`, which are permanent, disclosed narrowing and
+appear as `plantsExcluded` / `scopeNote` instead. A total that omits plants is not
+a company-wide figure regardless of what `complete` says.
+
+`estimatedValue` is unpopulated in Titan; it is omitted from totals (with an
+`estimatedValueOmitted` note) unless some matching order actually carries a value,
+rather than being reported as a misleading `$0`.
+
+`summarize_sales_orders` defaults to **`DateBasis=booked`**, because "sales" means
+booked here. Passing order-entry dates without switching to `DateBasis=order` is an
+error rather than a silently different number.
+
+## Relative periods
+
+Date-filtered tools accept `Period` instead of explicit dates — `lastWeek`,
+`thisWeek`, `lastMonth`, `thisMonth`, `lastQuarter`, `thisQuarter`, `ytd`,
+`priorYear`, `last7Days`, `last30Days`, `trailing12Months`, `today`, `yesterday`.
+The server resolves it against its own clock and returns the absolute range as
+`resolvedRange`, so the model never does date arithmetic.
+
+Conventions are fixed in code: **America/Denver**, **calendar year** (quarters
+Jan–Mar, Apr–Jun, …), and weeks running **Sunday–Saturday**. Titan's dates are
+date-only, so the zone is used solely to decide what "today" is — DST never affects
+the range maths. `Period` and explicit start/end dates are mutually exclusive.
+`get_server_time` returns today's date plus every period's resolved range.
+
+`npm run verify` includes `scripts/verify-periods.mjs`, which checks the resolver
+against fixed fixtures (week, month, quarter and year boundaries, leap day, DST
+transitions) — the alternative would be waiting a month to discover `lastMonth` was
+wrong.
 
 ## Configuration
 

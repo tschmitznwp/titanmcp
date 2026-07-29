@@ -1,6 +1,15 @@
 import { z, type ZodRawShape } from "zod";
-import type { ProductCatalog, TitanClient } from "./titanClient.js";
+import type { CatalogCustomer, ProductCatalog, TitanClient } from "./titanClient.js";
 import type { OrderIndex, OrderIndexEntry } from "./orderIndex.js";
+import {
+  PERIOD_NAMES,
+  PERIOD_DEFINITIONS,
+  REPORTING_TIME_ZONE,
+  resolvePeriod,
+  todayInZone,
+  type DateRange,
+  type PeriodName,
+} from "./periods.js";
 import {
   MAX_PAGES,
   datePart,
@@ -38,6 +47,89 @@ export interface ToolContext {
   client: TitanClient;
   orderIndex: OrderIndex;
 }
+
+// --- Response self-description (WI-2) -------------------------------------
+
+/** Absolute dates actually applied, normalized to YYYY-MM-DD. */
+function resolvedRange(start: unknown, end: unknown) {
+  const norm = (v: unknown) => (typeof v === "string" && v !== "" ? v.slice(0, 10) : null);
+  return { start: norm(start), end: norm(end) };
+}
+
+/**
+ * Permanent, disclosed narrowing of the result set (D-2). Kept separate from
+ * `coverage.complete`, which means only "answered from a fully-built index" —
+ * otherwise a deployment with a configured floor would report incomplete
+ * forever and the flag would stop meaning anything.
+ */
+function scopeFields(
+  excluded: Set<string>,
+  coversOrdersFrom?: string | null
+): {
+  plantsExcluded?: string[];
+  indexCoversOrdersEnteredFrom?: string;
+  scopeNote?: string;
+} {
+  const notes: string[] = [];
+  if (excluded.size > 0) {
+    notes.push(
+      `Totals exclude plant(s) ${[...excluded].sort().join(", ")} ` +
+        "(TITAN_EXCLUDED_PLANTS); this is not a company-wide figure."
+    );
+  }
+  if (coversOrdersFrom != null) {
+    notes.push(
+      `Only orders entered on or after ${coversOrdersFrom} are indexed ` +
+        "(TITAN_ORDER_INDEX_MIN_ORDER_DATE); an older order booked in the requested " +
+        "period would not appear."
+    );
+  }
+  if (notes.length === 0) return {};
+  return {
+    ...(excluded.size > 0 ? { plantsExcluded: [...excluded].sort() } : {}),
+    ...(coversOrdersFrom != null ? { indexCoversOrdersEnteredFrom: coversOrdersFrom } : {}),
+    scopeNote: notes.join(" "),
+  };
+}
+
+const periodParam = () =>
+  z
+    .enum(PERIOD_NAMES)
+    .optional()
+    .describe(
+      "Named relative period, resolved by the SERVER against its own clock in " +
+        `${REPORTING_TIME_ZONE} (calendar year; weeks run Sunday-Saturday). Prefer this over ` +
+        "computing dates yourself. Mutually exclusive with the explicit start/end dates for " +
+        "the same basis. The absolute range applied comes back as resolvedRange."
+    );
+
+/**
+ * Resolves a Period to a concrete range, refusing to guess when explicit dates were
+ * also supplied (WI-3). Returns undefined when no Period was given.
+ */
+function periodRange(
+  period: unknown,
+  explicit: { start?: unknown; end?: unknown },
+  label: string
+): DateRange | undefined {
+  if (period == null) return undefined;
+  if (explicit.start != null || explicit.end != null) {
+    throw new Error(
+      `Period and ${label} are mutually exclusive — pass one or the other, not both. ` +
+        "Period resolves the range on the server against its own clock."
+    );
+  }
+  return resolvePeriod(period as PeriodName, todayInZone());
+}
+
+/**
+ * Order-basis totals sum booked dollars over orders bucketed by ENTRY date — a
+ * legitimate figure and an easy one to mislabel as bookings. The measure differs
+ * between header sums and detail-line (product) sums, so it is named explicitly.
+ */
+const orderBasisNote = (measureDesc: string) =>
+  `Values are ${measureDesc} grouped by orderDate (entry date). This is NOT a bookings ` +
+  "figure — for bookings use DateBasis=booked.";
 
 async function tryGetProductCatalog(client: TitanClient): Promise<ProductCatalog | undefined> {
   try {
@@ -99,6 +191,7 @@ const groupSpecs: Record<string, GroupSpec> = {
   plant: { key: (row) => String(row.plantId ?? row.plantID ?? "unknown") },
   salesRep: { key: (row) => String(row.salesRep ?? "unknown") },
   jobStatus: { key: (row) => String(row.jobStatus ?? "unknown") },
+  jobType: { key: (row) => String(row.jobType ?? "unknown") },
   product: {
     key: (row) => String(row.productID ?? row.productId ?? "unknown"),
     label: (row) => row.description as string | undefined,
@@ -166,11 +259,16 @@ interface OrderFilter {
   plantId?: string;
   jobStatus?: string;
   salesRep?: string;
+  jobType?: string;
+  /** Booked basis with no date bounds: still restrict to orders that were booked. */
+  bookedOnly?: boolean;
 }
 
 interface ResolvedOrders {
   orders: OrderIndexEntry[];
   coverage: Record<string, unknown>;
+  /** Answered from a fully-built index (D-2). Drives the WI-7 fail-closed gate. */
+  complete: boolean;
   /** Response fields describing skipped/unreadable records. */
   notes: Record<string, unknown>;
 }
@@ -183,6 +281,7 @@ function matchesAttributes(entry: OrderIndexEntry, filter: OrderFilter, excluded
   if (filter.plantId != null && !eqIgnoreCase(entry.plantId, filter.plantId)) return false;
   if (filter.jobStatus != null && !eqIgnoreCase(entry.jobStatus, filter.jobStatus)) return false;
   if (filter.salesRep != null && !eqIgnoreCase(entry.salesRep, filter.salesRep)) return false;
+  if (filter.jobType != null && !eqIgnoreCase(entry.jobType, filter.jobType)) return false;
   return plantAllowed(excluded, entry.plantId);
 }
 
@@ -232,6 +331,14 @@ async function scanOrders(
         salesRep: (order.salesRep as string) ?? null,
         bookedValue: toNumber(order.bookedValue),
         estimatedValue: toNumber(order.estimatedValue),
+        jobType: (row.jobType as string) ?? null,
+        jobPriority: typeof row.jobPriority === "number" ? row.jobPriority : null,
+        startDate: dateOrNull(row.startDate),
+        completedDate: dateOrNull(row.completedDate),
+        expirationDate: dateOrNull(row.expirationDate),
+        reference: (row.reference as string) ?? null,
+        quote: (row.quote as string) ?? null,
+        lastModifiedDate: dateOrNull(row.lastModifiedDate),
         indexedAt: Date.now(),
       };
       return entry;
@@ -260,7 +367,10 @@ async function scanOrders(
  */
 async function resolveOrders(ctx: ToolContext, filter: OrderFilter): Promise<ResolvedOrders> {
   const excluded = ctx.client.excludedPlants;
-  const wantsBooked = filter.bookedDateStart != null || filter.bookedDateEnd != null;
+  const wantsBooked =
+    filter.bookedOnly === true ||
+    filter.bookedDateStart != null ||
+    filter.bookedDateEnd != null;
 
   if (await ctx.orderIndex.ensureReady(INDEX_WAIT_MS)) {
     const status = ctx.orderIndex.status();
@@ -269,22 +379,15 @@ async function resolveOrders(ctx: ToolContext, filter: OrderFilter): Promise<Res
       .filter((entry) => matchesAttributes(entry, filter, excluded));
     return {
       orders,
+      complete: true,
       coverage: {
         basis: "index",
-        complete: status.coversOrdersFrom == null,
+        complete: true,
         ordersIndexed: status.orders,
         indexBuiltAt: status.builtAt,
         indexLastRefreshedAt: status.lastRefreshAt,
         ...(status.refreshing ? { indexRefreshInProgress: true } : {}),
-        ...(status.coversOrdersFrom != null
-          ? {
-              indexCoversOrdersEnteredFrom: status.coversOrdersFrom,
-              indexFloorNote:
-                `This deployment only indexes orders entered on or after ${status.coversOrdersFrom} ` +
-                "(TITAN_ORDER_INDEX_MIN_ORDER_DATE). An older order booked in the requested " +
-                "period would not appear here.",
-            }
-          : {}),
+        ...scopeFields(excluded, status.coversOrdersFrom),
       },
       notes:
         status.failedOrders > 0
@@ -322,9 +425,11 @@ async function resolveOrders(ctx: ToolContext, filter: OrderFilter): Promise<Res
 
   return {
     orders,
+    complete: !wantsBooked,
     coverage: {
       basis: "partialScan",
       complete: !wantsBooked,
+      ...scopeFields(excluded, status.coversOrdersFrom),
       scannedOrderDateFrom: scanFrom ?? null,
       scannedOrderDateTo: scanTo ?? null,
       ordersScanned: scan.matched,
@@ -355,8 +460,45 @@ async function resolveOrders(ctx: ToolContext, filter: OrderFilter): Promise<Res
   };
 }
 
+/**
+ * WI-7: a partial answer must not be presentable as a final one. The error names the
+ * forbidden detours explicitly — a bare failure invites the model to "helpfully" fall
+ * back to order-date or invoice figures, which is the bug this server exists to stop.
+ */
+function assertComplete(ctx: ToolContext, resolved: ResolvedOrders, allowPartial: unknown): void {
+  if (resolved.complete || allowPartial === true) return;
+  const status = ctx.orderIndex.status();
+  const progress =
+    status.state === "building"
+      ? `${status.buildFetched} of ${status.buildFetched + status.buildRemaining} orders fetched`
+      : `index state: ${status.state}`;
+  throw new Error(
+    `Incomplete coverage: the booked-date index is not ready (${progress}), so a complete ` +
+      "answer for this booked-date range is not available yet. Do NOT substitute " +
+      "DateBasis=order, list_sales_orders, or invoice figures — they measure something " +
+      "different and would be wrong. Either retry once get_order_index_status reports " +
+      "state=ready, or pass AllowPartial=true to receive the partial result together with " +
+      "its incompleteWarning."
+  );
+}
+
+/**
+ * D-3: estimatedValue is unpopulated in Titan (null on every order observed). Reporting
+ * it as $0 reads as "we estimated nothing" rather than "not tracked", so it is omitted
+ * unless some matching order actually carries a value.
+ */
+function estimatedValueInUse(orders: OrderIndexEntry[]): boolean {
+  return orders.some((o) => toNumber(o.estimatedValue) !== 0);
+}
+
+const ESTIMATED_VALUE_OMITTED_NOTE = {
+  estimatedValueOmitted:
+    "estimatedValue is 0 or unset on every matching order in Titan, so it is omitted " +
+    "rather than reported as $0. Do not present it as a zero estimate.",
+};
+
 /** Compact order row returned to the model. */
-function presentOrder(entry: OrderIndexEntry) {
+function presentOrder(entry: OrderIndexEntry, includeEstimated: boolean) {
   return {
     jobNumber: entry.jobNumber,
     bookedDate: entry.bookedDate,
@@ -368,7 +510,7 @@ function presentOrder(entry: OrderIndexEntry) {
     jobStatus: entry.jobStatus,
     salesRep: entry.salesRep,
     bookedValue: round2(entry.bookedValue),
-    estimatedValue: round2(entry.estimatedValue),
+    ...(includeEstimated ? { estimatedValue: round2(entry.estimatedValue) } : {}),
   };
 }
 
@@ -382,6 +524,22 @@ export interface AggregateToolDef {
 
 const groupByParam = (values: [string, ...string[]], hint: string) =>
   z.enum(values).optional().describe(`Optional grouping for subtotals: ${hint}.`);
+
+/** Fold case and punctuation so "AAA Construction Inc" matches "AAA Construction, Inc.". */
+function normalizeForSearch(value: unknown): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/** exact > prefix > substring, so the obvious match sorts first. */
+function matchRank(haystack: string, needle: string): number | null {
+  if (needle === "") return 2;
+  if (haystack === needle) return 0;
+  if (haystack.startsWith(needle)) return 1;
+  return haystack.includes(needle) ? 2 : null;
+}
 
 export const aggregateToolDefs: AggregateToolDef[] = [
   {
@@ -400,14 +558,21 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     params: {
       BookedDateStart: z
         .string()
-        .describe("Booked date range start (YYYY-MM-DD, inclusive). Required."),
+        .optional()
+        .describe("Booked date range start (YYYY-MM-DD, inclusive). Required unless Period is used."),
       BookedDateEnd: z
         .string()
-        .describe("Booked date range end (YYYY-MM-DD, inclusive). Required."),
+        .optional()
+        .describe("Booked date range end (YYYY-MM-DD, inclusive). Required unless Period is used."),
+      Period: periodParam(),
       CustomerId: z.string().optional().describe("Filter by customer ID."),
       PlantId: z.string().optional().describe("Filter by plant ID."),
-      JobStatus: z.string().optional().describe("Filter by job status."),
+      JobStatus: z
+        .string()
+        .optional()
+        .describe("Filter by job status. Valid values come from list_job_statuses."),
       SalesRep: z.string().optional().describe("Filter by sales rep."),
+      JobType: z.string().optional().describe("Filter by job type (e.g. Precast)."),
       MinBookedValue: z
         .number()
         .optional()
@@ -431,12 +596,27 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         .string()
         .optional()
         .describe("Optional extra filter on the order (entry) date, range end."),
+      AllowPartial: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set true to accept a knowingly incomplete result while the booked-date index is " +
+            "still building. Without it, incomplete coverage is an error rather than a result."
+        ),
     },
     handler: async (ctx, args) => {
-      const bookedDateStart = String(args.BookedDateStart ?? "").slice(0, 10);
-      const bookedDateEnd = String(args.BookedDateEnd ?? "").slice(0, 10);
+      const period = periodRange(
+        args.Period,
+        { start: args.BookedDateStart, end: args.BookedDateEnd },
+        "BookedDateStart/BookedDateEnd"
+      );
+      const bookedDateStart = String(period?.start ?? args.BookedDateStart ?? "").slice(0, 10);
+      const bookedDateEnd = String(period?.end ?? args.BookedDateEnd ?? "").slice(0, 10);
       if (!bookedDateStart || !bookedDateEnd) {
-        throw new Error("BookedDateStart and BookedDateEnd are required (YYYY-MM-DD).");
+        throw new Error(
+          "A booked-date range is required: pass BookedDateStart and BookedDateEnd " +
+            "(YYYY-MM-DD), or a Period such as lastWeek."
+        );
       }
       if (bookedDateStart > bookedDateEnd) {
         throw new Error(
@@ -453,11 +633,15 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         ...(args.PlantId != null ? { plantId: String(args.PlantId) } : {}),
         ...(args.JobStatus != null ? { jobStatus: String(args.JobStatus) } : {}),
         ...(args.SalesRep != null ? { salesRep: String(args.SalesRep) } : {}),
+        ...(args.JobType != null ? { jobType: String(args.JobType) } : {}),
       };
 
-      const { orders, coverage, notes } = await resolveOrders(ctx, filter);
+      const resolved = await resolveOrders(ctx, filter);
+      assertComplete(ctx, resolved, args.AllowPartial);
+      const { orders, coverage, notes } = resolved;
       const minValue = args.MinBookedValue == null ? null : Number(args.MinBookedValue);
       const matched = minValue == null ? orders : orders.filter((o) => o.bookedValue >= minValue);
+      const withEstimated = estimatedValueInUse(matched);
 
       const sortBy = (args.SortBy as string) ?? "bookedDate";
       const sorted = [...matched].sort((a, b) => {
@@ -480,14 +664,23 @@ export const aggregateToolDefs: AggregateToolDef[] = [
 
       return {
         measure: "sales orders whose bookedDate falls in the requested range",
-        dateBasis: "bookedDate (when the order was booked, NOT when it was entered)",
+        dateBasis: "booked",
+        dateField: "bookedDate",
+        resolvedRange: resolvedRange(bookedDateStart, bookedDateEnd),
+        ...(args.Period != null
+          ? { period: args.Period, periodDefinition: PERIOD_DEFINITIONS[args.Period as PeriodName] }
+          : {}),
+        measureFields: withEstimated ? ["bookedValue", "estimatedValue"] : ["bookedValue"],
+        ...(withEstimated || matched.length === 0 ? {} : ESTIMATED_VALUE_OMITTED_NOTE),
         filters: {
           BookedDateStart: bookedDateStart,
           BookedDateEnd: bookedDateEnd,
+          Period: args.Period ?? null,
           CustomerId: args.CustomerId ?? null,
           PlantId: args.PlantId ?? null,
           JobStatus: args.JobStatus ?? null,
           SalesRep: args.SalesRep ?? null,
+          JobType: args.JobType ?? null,
           MinBookedValue: minValue,
           OrderDateStart: args.OrderDateStart ?? null,
           OrderDateEnd: args.OrderDateEnd ?? null,
@@ -498,7 +691,9 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         count: matched.length,
         totals: {
           bookedValue: round2(matched.reduce((sum, o) => sum + o.bookedValue, 0)),
-          estimatedValue: round2(matched.reduce((sum, o) => sum + o.estimatedValue, 0)),
+          ...(withEstimated
+            ? { estimatedValue: round2(matched.reduce((sum, o) => sum + o.estimatedValue, 0)) }
+            : {}),
         },
         returned: returned.length,
         ...(returned.length < matched.length
@@ -509,7 +704,213 @@ export const aggregateToolDefs: AggregateToolDef[] = [
                 "count and totals above cover all matches; raise Limit to list more.",
             }
           : {}),
-        orders: returned.map(presentOrder),
+        orders: returned.map((entry) => presentOrder(entry, withEstimated)),
+      };
+    },
+  },
+  {
+    name: "search_customers",
+    title: "Search customers by name",
+    description:
+      "Finds customers by company name or customer ID and returns the CustomerId needed by the " +
+      "other tools, with city, state, status and sales rep to tell similar names apart. The " +
+      "Titan API has no name filter, so this searches a cached snapshot of the customer list. " +
+      "Use this instead of paging through list_customers, and never guess a CustomerId. " +
+      "Matching ignores case and punctuation, so 'AAA Construction Inc' finds " +
+      "'AAA Construction, Inc.'.",
+    params: {
+      Query: z
+        .string()
+        .describe("Company name (full or partial) or customer ID to search for."),
+      Status: z
+        .string()
+        .optional()
+        .describe("Restrict to a customer status code (A, H, P, S, N). Omit to search all."),
+      Limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe("Maximum matches to return (default 25)."),
+    },
+    handler: async (ctx, args) => {
+      const query = String(args.Query ?? "").trim();
+      if (query === "") throw new Error("Query is required (a company name or customer ID).");
+      const needle = normalizeForSearch(query);
+      const catalog = await ctx.client.getCustomerCatalog();
+
+      const scored: { rank: number; customer: CatalogCustomer }[] = [];
+      for (const customer of catalog.values()) {
+        if (args.Status != null && !eqIgnoreCase(customer.status, args.Status)) continue;
+        const byName = matchRank(normalizeForSearch(customer.companyName), needle);
+        const byId = matchRank(normalizeForSearch(customer.customerID), needle);
+        const rank = Math.min(byName ?? 99, byId ?? 99);
+        if (rank < 99) scored.push({ rank, customer });
+      }
+      scored.sort(
+        (a, b) =>
+          a.rank - b.rank ||
+          String(a.customer.companyName ?? "").localeCompare(String(b.customer.companyName ?? ""))
+      );
+
+      const limit = Math.min(Number(args.Limit ?? 25), 200);
+      const matches = scored.slice(0, limit).map(({ customer }) => ({
+        customerId: customer.customerID,
+        companyName: customer.companyName ?? null,
+        city: customer.city ?? null,
+        state: customer.state ?? null,
+        status: customer.status ?? null,
+        salesRep: customer.salesRep ?? null,
+      }));
+
+      return {
+        measure: "customers matching the search term",
+        filters: { Query: query, Status: args.Status ?? null },
+        customersSearched: catalog.size,
+        count: scored.length,
+        returned: matches.length,
+        ...(matches.length < scored.length
+          ? {
+              truncated: true,
+              truncationNote: `Showing ${matches.length} of ${scored.length} matches; raise Limit for more.`,
+            }
+          : {}),
+        ...(scored.length === 0
+          ? {
+              noMatchNote:
+                "No customer matched. Do not guess a CustomerId — ask the user to confirm the " +
+                "name, or try a shorter/distinctive fragment of it.",
+            }
+          : {}),
+        customers: matches,
+      };
+    },
+  },
+  {
+    name: "search_products",
+    title: "Search products by name or ID",
+    description:
+      "Finds products by description or product ID and returns real Titan ProductIds for use as " +
+      "filter values. The Titan API has no name/description filter, so this searches the cached " +
+      "product catalog. Use this to ground a product before quoting figures for it, and never " +
+      "invent a ProductId. Matching ignores case and punctuation.",
+    params: {
+      Query: z.string().describe("Product description (full or partial) or product ID."),
+      Limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe("Maximum matches to return (default 25)."),
+    },
+    handler: async (ctx, args) => {
+      const query = String(args.Query ?? "").trim();
+      if (query === "") throw new Error("Query is required (a product description or ID).");
+      const needle = normalizeForSearch(query);
+      const catalog = await ctx.client.getProductCatalog();
+
+      const scored: { rank: number; product: { productID: string; description?: string; unitOfMeasure?: string } }[] = [];
+      for (const product of catalog.values()) {
+        const byName = matchRank(normalizeForSearch(product.description), needle);
+        const byId = matchRank(normalizeForSearch(product.productID), needle);
+        const rank = Math.min(byName ?? 99, byId ?? 99);
+        if (rank < 99) scored.push({ rank, product });
+      }
+      scored.sort(
+        (a, b) => a.rank - b.rank || a.product.productID.localeCompare(b.product.productID)
+      );
+
+      const limit = Math.min(Number(args.Limit ?? 25), 200);
+      const matches = scored.slice(0, limit).map(({ product }) => ({
+        productId: product.productID,
+        description: product.description ?? null,
+        unitOfMeasure: product.unitOfMeasure ?? null,
+      }));
+
+      return {
+        measure: "products matching the search term",
+        filters: { Query: query },
+        productsSearched: catalog.size,
+        count: scored.length,
+        returned: matches.length,
+        ...(matches.length < scored.length
+          ? {
+              truncated: true,
+              truncationNote: `Showing ${matches.length} of ${scored.length} matches; raise Limit for more.`,
+            }
+          : {}),
+        ...(scored.length === 0
+          ? {
+              noMatchNote:
+                "No product matched. Do not invent a ProductId — report that the product was not " +
+                "found in the catalog.",
+            }
+          : {}),
+        products: matches,
+      };
+    },
+  },
+  {
+    name: "list_job_statuses",
+    title: "List job statuses and job types",
+    description:
+      "Returns the jobStatus and jobType values actually present on Titan sales orders, with " +
+      "order counts and how many orders in each status have been booked. Use it to populate the " +
+      "JobStatus/JobType filters rather than guessing a code. NOTE: this is DERIVED from the " +
+      "indexed orders, not a master reference table — a status that no order currently uses will " +
+      "not appear, so absence is not proof the code is invalid. Counts cover all plants, " +
+      "including any excluded from the summarize_* totals.",
+    params: {},
+    handler: async (ctx) => {
+      if (!(await ctx.orderIndex.ensureReady(INDEX_WAIT_MS))) {
+        const status = ctx.orderIndex.status();
+        throw new Error(
+          "The sales-order index is not ready yet, and job statuses are derived from it " +
+            `(${status.state}: ${status.buildFetched} of ` +
+            `${status.buildFetched + status.buildRemaining} orders fetched). Retry once ` +
+            "get_order_index_status reports state=ready."
+        );
+      }
+      const status = ctx.orderIndex.status();
+      return {
+        measure: "distinct jobStatus and jobType values across all indexed sales orders",
+        derivedFrom: "the sales-order index (not a Titan reference table)",
+        ordersIndexed: status.orders,
+        indexBuiltAt: status.builtAt,
+        note:
+          "booked = orders in this status that carry a bookedDate; unbooked = those that do " +
+          "not. Plant exclusions are deliberately NOT applied here.",
+        jobStatuses: ctx.orderIndex.statusBreakdown(),
+        jobTypes: ctx.orderIndex.typeBreakdown(),
+      };
+    },
+  },
+  {
+    name: "get_server_time",
+    title: "Get server time and resolved periods",
+    description:
+      "Returns the server's current date in the NWPX reporting time zone plus the absolute " +
+      "date range each named Period resolves to right now. Use it to anchor any date reasoning " +
+      "you do yourself, and prefer passing Period to the summarize_*/list_booked_orders tools " +
+      "over computing ranges by hand.",
+    params: {},
+    handler: async () => {
+      const now = new Date();
+      const today = todayInZone(now);
+      return {
+        serverTimeUtc: now.toISOString(),
+        timeZone: REPORTING_TIME_ZONE,
+        today,
+        fiscalCalendar: "calendar year (quarters are Jan-Mar, Apr-Jun, Jul-Sep, Oct-Dec)",
+        weekDefinition: "weeks run Sunday through Saturday",
+        periods: Object.fromEntries(
+          PERIOD_NAMES.map((name) => [
+            name,
+            { ...resolvePeriod(name, today), definition: PERIOD_DEFINITIONS[name] },
+          ])
+        ),
       };
     },
   },
@@ -548,11 +949,14 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       "Aggregates sales orders (bookings) without returning individual orders: finds matching " +
       "orders, fetches their values, and returns counts and summed bookedValue/estimatedValue, " +
       "optionally grouped. Use this instead of list_sales_orders for questions about sales " +
-      "totals, e.g. a customer's annual sales. DATE BASIS MATTERS: by default dates filter on " +
-      "the ORDER (entry) date via OrderDateStart/OrderDateEnd. For 'booked in <period>' " +
-      "questions set DateBasis=booked and pass BookedDateStart/BookedDateEnd instead — the two " +
-      "give very different numbers, and the Titan API has no bookedDate filter of its own (this " +
-      "server maintains an index for it). GroupBy product (or a ProductID filter) switches to " +
+      "totals, e.g. a customer's annual sales. DATE BASIS: defaults to BOOKED (bookedDate), " +
+      "which is what 'sales', 'bookings' and 'sold' mean — pass BookedDateStart/BookedDateEnd or " +
+      "Period. Pass DateBasis=order with OrderDateStart/OrderDateEnd only when the user " +
+      "explicitly asks about when orders were ENTERED; the two give very different numbers, and " +
+      "the Titan API has no bookedDate filter of its own (this server maintains an index for " +
+      "it). Use Period (e.g. lastWeek, lastMonth, ytd) instead of computing dates yourself; the " +
+      "server resolves it and reports the absolute range in resolvedRange. GroupBy product (or " +
+      "a ProductID filter) switches to " +
       "order DETAIL LINES and sums sellValue (quantityOrdered x sellUnitPrice), quantityOrdered, " +
       "and yards per product - use that for questions like which products sold the most in " +
       "dollars. When grouped by product each group is enriched with productName (from the Titan " +
@@ -564,65 +968,137 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         .enum(["order", "booked"])
         .optional()
         .describe(
-          "Which date the range filters and year/month groupings use: 'order' (default, the " +
-            "order/entry date) or 'booked' (the bookedDate). Use 'booked' for booking reports."
+          "Which date the range filters and year/month groupings use. DEFAULTS TO 'booked' " +
+            "(the bookedDate — what 'sales', 'bookings' and 'sold' mean). Pass 'order' only " +
+            "when the user explicitly asks about when orders were ENTERED/created, which is a " +
+            "different measure. Always state which basis you used."
         ),
+      Period: periodParam(),
       CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
       PlantId: z.string().optional().describe("Filter by plant ID."),
-      JobStatus: z.string().optional().describe("Filter by job status."),
+      JobStatus: z
+        .string()
+        .optional()
+        .describe("Filter by job status. Valid values come from list_job_statuses."),
       SalesRep: z.string().optional().describe("Filter by sales rep."),
+      JobType: z
+        .string()
+        .optional()
+        .describe("Filter by job type (e.g. Precast). Valid values come from list_job_statuses."),
       ProductID: z.string().optional().describe("Only count order detail lines for this product ID."),
       OrderDateStart: z.string().optional().describe("Order (entry) date range start (YYYY-MM-DD, inclusive)."),
       OrderDateEnd: z.string().optional().describe("Order (entry) date range end (YYYY-MM-DD, inclusive)."),
       BookedDateStart: z.string().optional().describe("Booked date range start (YYYY-MM-DD, inclusive)."),
       BookedDateEnd: z.string().optional().describe("Booked date range end (YYYY-MM-DD, inclusive)."),
+      AllowPartial: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set true to accept a knowingly incomplete booked-date result while the index is " +
+            "still building. Without it, incomplete coverage is an error rather than a result."
+        ),
       GroupBy: groupByParam(
-        ["year", "month", "customer", "plant", "jobStatus", "salesRep", "product"],
-        "year, month, customer, plant, jobStatus, salesRep, or product (product switches to detail-line sums)"
+        ["year", "month", "customer", "plant", "jobStatus", "salesRep", "jobType", "product"],
+        "year, month, customer, plant, jobStatus, salesRep, jobType, or product (product " +
+          "switches to detail-line sums)"
       ),
     },
     handler: async (ctx, args) => {
-      const hasBookedRange = args.BookedDateStart != null || args.BookedDateEnd != null;
-      const basis = (args.DateBasis as string) ?? (hasBookedRange ? "booked" : "order");
-      if (basis === "booked" && !hasBookedRange) {
+      // D-5: booked is the default basis — "sales" means booked at NWPX, so an
+      // omitted DateBasis must not quietly produce an entry-date figure.
+      const basis = (args.DateBasis as string) ?? "booked";
+
+      const period = periodRange(
+        args.Period,
+        basis === "booked"
+          ? { start: args.BookedDateStart, end: args.BookedDateEnd }
+          : { start: args.OrderDateStart, end: args.OrderDateEnd },
+        basis === "booked" ? "BookedDateStart/BookedDateEnd" : "OrderDateStart/OrderDateEnd"
+      );
+
+      const bookedStart = (period && basis === "booked" ? period.start : args.BookedDateStart) as
+        | string
+        | undefined;
+      const bookedEnd = (period && basis === "booked" ? period.end : args.BookedDateEnd) as
+        | string
+        | undefined;
+      const orderStart = (period && basis === "order" ? period.start : args.OrderDateStart) as
+        | string
+        | undefined;
+      const orderEnd = (period && basis === "order" ? period.end : args.OrderDateEnd) as
+        | string
+        | undefined;
+
+      const hasBookedRange = bookedStart != null || bookedEnd != null;
+      const hasOrderRange = orderStart != null || orderEnd != null;
+
+      // A booked basis with order dates and no booked range is the ambiguous case:
+      // the caller almost certainly wanted one or the other, so name both exits
+      // rather than guessing. With no dates at all, an unbounded booked query is
+      // perfectly answerable from the index, so it is allowed.
+      if (basis === "booked" && !hasBookedRange && hasOrderRange) {
         throw new Error(
-          "DateBasis=booked requires BookedDateStart and/or BookedDateEnd (OrderDateStart/" +
-            "OrderDateEnd filter the order entry date, which is a different measure). Call this " +
-            "tool again with the booked-date range."
+          "You passed order-entry dates but the date basis is 'booked' (the default). For " +
+            "bookings, pass BookedDateStart/BookedDateEnd (or Period). To filter on when orders " +
+            "were ENTERED instead, pass DateBasis=order — that is a different measure and is not " +
+            "a bookings figure."
+        );
+      }
+      if (basis === "order" && hasBookedRange) {
+        throw new Error(
+          "DateBasis=order filters on OrderDateStart/OrderDateEnd; BookedDateStart/BookedDateEnd " +
+            "apply only to DateBasis=booked. Pass one basis and its matching dates."
         );
       }
 
       const filter: OrderFilter = {
-        ...(args.BookedDateStart != null ? { bookedDateStart: String(args.BookedDateStart) } : {}),
-        ...(args.BookedDateEnd != null ? { bookedDateEnd: String(args.BookedDateEnd) } : {}),
-        ...(args.OrderDateStart != null ? { orderDateStart: String(args.OrderDateStart) } : {}),
-        ...(args.OrderDateEnd != null ? { orderDateEnd: String(args.OrderDateEnd) } : {}),
+        ...(basis === "booked" ? { bookedOnly: true } : {}),
+        ...(bookedStart != null ? { bookedDateStart: String(bookedStart) } : {}),
+        ...(bookedEnd != null ? { bookedDateEnd: String(bookedEnd) } : {}),
+        ...(orderStart != null ? { orderDateStart: String(orderStart) } : {}),
+        ...(orderEnd != null ? { orderDateEnd: String(orderEnd) } : {}),
         ...(args.CustomerId != null ? { customerId: String(args.CustomerId) } : {}),
         ...(args.PlantId != null ? { plantId: String(args.PlantId) } : {}),
         ...(args.JobStatus != null ? { jobStatus: String(args.JobStatus) } : {}),
         ...(args.SalesRep != null ? { salesRep: String(args.SalesRep) } : {}),
+        ...(args.JobType != null ? { jobType: String(args.JobType) } : {}),
       };
 
-      const { orders, coverage, notes } = await resolveOrders(ctx, filter);
+      const resolved = await resolveOrders(ctx, filter);
+      assertComplete(ctx, resolved, args.AllowPartial);
+      const { orders, coverage, notes } = resolved;
       const dateField = basis === "booked" ? "bookedDate" : "orderDate";
+      const withEstimated = estimatedValueInUse(orders);
+      const orderSumFields = withEstimated ? ["bookedValue", "estimatedValue"] : ["bookedValue"];
 
       const base = {
         measure:
           basis === "booked"
-            ? "sales orders by bookedDate (bookings); sums are bookedValue and estimatedValue"
-            : "sales orders by order (entry) date; sums are bookedValue and estimatedValue",
-        dateBasis: dateField,
+            ? "sales orders by bookedDate (bookings); sums are bookedValue"
+            : "sales orders by order (entry) date; sums are bookedValue",
+        dateBasis: basis,
+        dateField,
+        resolvedRange:
+          basis === "booked"
+            ? resolvedRange(bookedStart, bookedEnd)
+            : resolvedRange(orderStart, orderEnd),
+        ...(args.Period != null
+          ? { period: args.Period, periodDefinition: PERIOD_DEFINITIONS[args.Period as PeriodName] }
+          : {}),
+        measureFields: orderSumFields,
         filters: {
           DateBasis: basis,
           CustomerId: args.CustomerId ?? null,
           PlantId: args.PlantId ?? null,
           JobStatus: args.JobStatus ?? null,
           SalesRep: args.SalesRep ?? null,
+          JobType: args.JobType ?? null,
           ProductID: args.ProductID ?? null,
-          OrderDateStart: args.OrderDateStart ?? null,
-          OrderDateEnd: args.OrderDateEnd ?? null,
-          BookedDateStart: args.BookedDateStart ?? null,
-          BookedDateEnd: args.BookedDateEnd ?? null,
+          Period: args.Period ?? null,
+          OrderDateStart: orderStart ?? null,
+          OrderDateEnd: orderEnd ?? null,
+          BookedDateStart: bookedStart ?? null,
+          BookedDateEnd: bookedEnd ?? null,
           ...excludedPlantsNote(ctx.client.excludedPlants),
         },
         coverage,
@@ -685,6 +1161,14 @@ export const aggregateToolDefs: AggregateToolDef[] = [
           measure:
             "sales order detail lines (bookings); sums are sellValue " +
             "(quantityOrdered x sellUnitPrice), quantityOrdered, and yards",
+          measureFields: ["sellValue", "quantityOrdered", "yards"],
+          ...(basis === "order"
+            ? {
+                measureNote: orderBasisNote(
+                  "sellValue (quantityOrdered x sellUnitPrice) on order detail lines"
+                ),
+              }
+            : {}),
           ...agg,
           ...(effectiveGroupBy === "product"
             ? { groups: enrichProductGroups(agg.groups, catalog) }
@@ -698,9 +1182,13 @@ export const aggregateToolDefs: AggregateToolDef[] = [
 
       return {
         ...base,
+        ...(basis === "order"
+          ? { measureNote: orderBasisNote("bookedValue (booked dollars)") }
+          : {}),
+        ...(withEstimated || orders.length === 0 ? {} : ESTIMATED_VALUE_OMITTED_NOTE),
         ...aggregate(
           orders as unknown as Record<string, unknown>[],
-          ["bookedValue", "estimatedValue"],
+          orderSumFields,
           dateField,
           args.GroupBy as string
         ),
@@ -728,6 +1216,7 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       ProductID: z.string().optional().describe("Only count detail lines for this product ID."),
       StartProductionDate: z.string().optional().describe("Production date range start (YYYY-MM-DD, inclusive)."),
       EndProductionDate: z.string().optional().describe("Production date range end (YYYY-MM-DD, inclusive)."),
+      Period: periodParam(),
       GroupBy: groupByParam(
         ["year", "month", "plant", "product", "department"],
         "year, month, plant, product, or department"
@@ -735,12 +1224,19 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     },
     handler: async (ctx, args) => {
       const client = ctx.client;
+      const period = periodRange(
+        args.Period,
+        { start: args.StartProductionDate, end: args.EndProductionDate },
+        "StartProductionDate/EndProductionDate"
+      );
+      const startDate = period?.start ?? args.StartProductionDate;
+      const endDate = period?.end ?? args.EndProductionDate;
       const serverQuery: Record<string, unknown> = {
         PlantID: args.PlantID,
         ProductionDepartment: args.ProductionDepartment,
         Type: args.Type,
-        StartProductionDate: args.StartProductionDate,
-        EndProductionDate: args.EndProductionDate,
+        StartProductionDate: startDate,
+        EndProductionDate: endDate,
       };
       const { rows, pagesFetched, truncated, skipped } = await fetchAllPages(
         client,
@@ -753,13 +1249,26 @@ export const aggregateToolDefs: AggregateToolDef[] = [
         measure:
           "posted production entry detail lines; sums are quantity (scheduled), " +
           "quantityProd (produced), yards, cubicMeters, and tons",
+        dateBasis: "production",
+        dateField: "date",
+        resolvedRange: resolvedRange(startDate, endDate),
+        ...(args.Period != null
+          ? { period: args.Period, periodDefinition: PERIOD_DEFINITIONS[args.Period as PeriodName] }
+          : {}),
+        measureFields: ["quantity", "quantityProd", "yards", "cubicMeters", "tons"],
+        coverage: {
+          basis: "apiQuery",
+          complete: !truncated,
+          ...scopeFields(client.excludedPlants),
+        },
         filters: {
           PlantID: args.PlantID ?? null,
           ProductionDepartment: args.ProductionDepartment ?? null,
           Type: args.Type ?? null,
           ProductID: args.ProductID ?? null,
-          StartProductionDate: args.StartProductionDate ?? null,
-          EndProductionDate: args.EndProductionDate ?? null,
+          Period: args.Period ?? null,
+          StartProductionDate: startDate ?? null,
+          EndProductionDate: endDate ?? null,
           ...excludedPlantsNote(client.excludedPlants),
         },
         entriesMatched: kept.length,
@@ -832,15 +1341,18 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     description:
       "Aggregates posted customer (AR) invoices without returning individual invoices: pages " +
       "through the full result set server-side and returns counts and summed subtotal/tax/total, " +
-      "optionally grouped. Use this instead of list_invoices for questions about invoiced/billed " +
-      "revenue totals. Dates filter on the invoice date (inclusive). Credit invoices are included " +
-      "as returned by the API (negative or credit amounts net against totals).",
+      "optionally grouped. BILLED/INVOICED REVENUE (AR) ONLY — this is NOT a substitute for " +
+      "sales or bookings figures, which come from summarize_sales_orders (DateBasis=booked) or " +
+      "list_booked_orders. Use it only when the user explicitly asks about invoiced or billed " +
+      "amounts. Dates filter on the invoice date (inclusive). Credit invoices are included as " +
+      "returned by the API (negative or credit amounts net against totals).",
     params: {
       CustomerId: z.string().optional().describe("Filter by customer ID (recommended when known)."),
       PlantId: z.string().optional().describe("Filter by plant ID."),
       TicketType: z.string().optional().describe("Filter by ticket type."),
       StartDate: z.string().optional().describe("Invoice date range start (YYYY-MM-DD, inclusive)."),
       EndDate: z.string().optional().describe("Invoice date range end (YYYY-MM-DD, inclusive)."),
+      Period: periodParam(),
       GroupBy: groupByParam(
         ["year", "month", "customer", "plant", "salesRep"],
         "year, month, customer, plant, or salesRep"
@@ -848,12 +1360,19 @@ export const aggregateToolDefs: AggregateToolDef[] = [
     },
     handler: async (ctx, args) => {
       const client = ctx.client;
+      const period = periodRange(
+        args.Period,
+        { start: args.StartDate, end: args.EndDate },
+        "StartDate/EndDate"
+      );
+      const startDate = period?.start ?? args.StartDate;
+      const endDate = period?.end ?? args.EndDate;
       const serverQuery: Record<string, unknown> = {
         CustomerId: args.CustomerId,
         PlantId: args.PlantId,
         TicketType: args.TicketType,
-        StartDate: args.StartDate,
-        EndDate: args.EndDate,
+        StartDate: startDate,
+        EndDate: endDate,
       };
       const { rows, pagesFetched, truncated, skipped } = await fetchAllPages(
         client,
@@ -863,12 +1382,25 @@ export const aggregateToolDefs: AggregateToolDef[] = [
       const kept = rows.filter((row) => plantAllowed(client.excludedPlants, row.plantId));
       return {
         measure: "posted AR invoices (billed revenue); sums are subtotal, tax, and total",
+        dateBasis: "invoice",
+        dateField: "invoiceDate",
+        resolvedRange: resolvedRange(startDate, endDate),
+        ...(args.Period != null
+          ? { period: args.Period, periodDefinition: PERIOD_DEFINITIONS[args.Period as PeriodName] }
+          : {}),
+        measureFields: ["subtotal", "tax", "total"],
+        coverage: {
+          basis: "apiQuery",
+          complete: !truncated,
+          ...scopeFields(client.excludedPlants),
+        },
         filters: {
           CustomerId: args.CustomerId ?? null,
           PlantId: args.PlantId ?? null,
           TicketType: args.TicketType ?? null,
-          StartDate: args.StartDate ?? null,
-          EndDate: args.EndDate ?? null,
+          Period: args.Period ?? null,
+          StartDate: startDate ?? null,
+          EndDate: endDate ?? null,
           ...excludedPlantsNote(client.excludedPlants),
         },
         scanned: rows.length,

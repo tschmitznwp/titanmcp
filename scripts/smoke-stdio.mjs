@@ -3,7 +3,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-const EXPECTED_TOOL_COUNT = 37;
+const EXPECTED_TOOL_COUNT = 41;
 
 const transport = new StdioClientTransport({
   command: process.execPath,
@@ -65,17 +65,64 @@ if (badRange.isError !== true || !(badRange.content?.[0]?.text ?? "").includes("
   process.exit(1);
 }
 
-// DateBasis=booked without a booked range must be refused, not silently
-// answered from the order date (the bug this release exists to prevent).
+// summarize_invoices must carry the "not a sales substitute" prohibition (WI-6),
+// since that rule reaches the model on every call rather than only via the prompt.
+const invoiceTool = tools.find((t) => t.name === "summarize_invoices");
+if (!/not a substitute/i.test(invoiceTool?.description ?? "")) {
+  console.error("FAIL: summarize_invoices description is missing the sales-substitute prohibition");
+  process.exit(1);
+}
+
+// Both booked-date tools must expose AllowPartial (WI-7 fail-closed escape hatch).
+for (const name of ["list_booked_orders", "summarize_sales_orders"]) {
+  const tool = tools.find((t) => t.name === name);
+  if (!tool?.inputSchema?.properties?.AllowPartial) {
+    console.error(`FAIL: ${name} is missing the AllowPartial parameter`);
+    process.exit(1);
+  }
+}
+
+// Order-entry dates on a booked basis (including the default) must be refused
+// rather than silently answered from the wrong date — the bug this exists to stop.
 const wrongBasis = await client.callTool({
   name: "summarize_sales_orders",
-  arguments: { DateBasis: "booked", OrderDateStart: "2026-07-19", OrderDateEnd: "2026-07-25" },
+  arguments: { OrderDateStart: "2026-07-19", OrderDateEnd: "2026-07-25" },
 });
 if (
   wrongBasis.isError !== true ||
-  !(wrongBasis.content?.[0]?.text ?? "").includes("requires BookedDateStart")
+  !/date basis is 'booked'/i.test(wrongBasis.content?.[0]?.text ?? "")
 ) {
-  console.error("FAIL: expected DateBasis=booked to require a booked range, got:", JSON.stringify(wrongBasis));
+  console.error(
+    "FAIL: expected order dates under the default booked basis to error, got:",
+    JSON.stringify(wrongBasis)
+  );
+  process.exit(1);
+}
+
+// Period and explicit dates are mutually exclusive (WI-3).
+const bothRanges = await client.callTool({
+  name: "list_booked_orders",
+  arguments: { Period: "lastWeek", BookedDateStart: "2026-07-19", BookedDateEnd: "2026-07-25" },
+});
+if (
+  bothRanges.isError !== true ||
+  !/mutually exclusive/i.test(bothRanges.content?.[0]?.text ?? "")
+) {
+  console.error("FAIL: expected Period + explicit dates to be rejected, got:", JSON.stringify(bothRanges));
+  process.exit(1);
+}
+
+// get_server_time needs no API access, so it must return real data even here —
+// this is the end-to-end check that period resolution is wired to the tools.
+const serverTime = await client.callTool({ name: "get_server_time", arguments: {} });
+const timePayload = JSON.parse(serverTime.content?.[0]?.text ?? "{}");
+if (
+  serverTime.isError === true ||
+  !/^\d{4}-\d{2}-\d{2}$/.test(timePayload.today ?? "") ||
+  timePayload.timeZone !== "America/Denver" ||
+  !/^\d{4}-\d{2}-\d{2}$/.test(timePayload.periods?.lastWeek?.start ?? "")
+) {
+  console.error("FAIL: get_server_time did not return resolved periods, got:", JSON.stringify(serverTime));
   process.exit(1);
 }
 

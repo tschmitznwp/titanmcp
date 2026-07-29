@@ -50,8 +50,36 @@ export interface OrderIndexEntry {
   salesRep: string | null;
   bookedValue: number;
   estimatedValue: number;
+  // Fields below come from the /SalesOrders LIST row, which the index pages on
+  // every refresh anyway — so they cost no extra API calls and are backfilled
+  // into restored snapshots without a rebuild (see applyListRow).
+  jobType?: string | null;
+  jobPriority?: number | null;
+  startDate?: string | null;
+  completedDate?: string | null;
+  expirationDate?: string | null;
+  reference?: string | null;
+  quote?: string | null;
+  lastModifiedDate?: string | null;
   /** Epoch ms when this entry was last fetched from the API. */
   indexedAt: number;
+}
+
+/**
+ * Copies the list-derived fields onto an entry. Deliberately does NOT touch
+ * jobStatus: that field is the incremental refresh's change detector (list value
+ * vs. last indexed value), so overwriting it here would make an order look
+ * current while its bookedDate and bookedValue stayed stale.
+ */
+function applyListRow(entry: OrderIndexEntry, row: Record<string, unknown>): void {
+  entry.jobType = (row.jobType as string) ?? null;
+  entry.jobPriority = typeof row.jobPriority === "number" ? row.jobPriority : null;
+  entry.startDate = dateOrNull(row.startDate);
+  entry.completedDate = dateOrNull(row.completedDate);
+  entry.expirationDate = dateOrNull(row.expirationDate);
+  entry.reference = (row.reference as string) ?? null;
+  entry.quote = (row.quote as string) ?? null;
+  entry.lastModifiedDate = dateOrNull(row.lastModifiedDate);
 }
 
 export interface OrderIndexOptions {
@@ -95,6 +123,7 @@ export interface OrderQuery {
   plantId?: string;
   jobStatus?: string;
   salesRep?: string;
+  jobType?: string;
   /** Only orders that have a bookedDate at all. */
   bookedOnly?: boolean;
   excludedPlants?: Set<string>;
@@ -234,7 +263,12 @@ export class OrderIndex {
         continue;
       }
       jobNumbers.add(jobNumber);
-      if (mode === "full" || this.needsFetch(jobNumber, row)) stale.push(row);
+      // needsFetch reads the last indexed jobStatus, so evaluate it before the
+      // list fields are refreshed onto the entry.
+      const refetch = mode === "full" || this.needsFetch(jobNumber, row);
+      const existing = this.entries.get(jobNumber);
+      if (existing) applyListRow(existing, row);
+      if (refetch) stale.push(row);
     }
     if (belowFloor > 0) {
       console.error(
@@ -324,7 +358,7 @@ export class OrderIndex {
         `/api/v1/SalesOrders/${encodeURIComponent(jobNumber)}`
       );
       const order = (data.result ?? {}) as Record<string, unknown>;
-      return {
+      const entry: OrderIndexEntry = {
         jobNumber,
         orderDate: dateOrNull(order.orderDate) ?? dateOrNull(listRow.orderDate),
         bookedDate: dateOrNull(order.bookedDate),
@@ -339,6 +373,8 @@ export class OrderIndex {
         estimatedValue: toNumber(order.estimatedValue),
         indexedAt: Date.now(),
       };
+      applyListRow(entry, listRow);
+      return entry;
     } catch (err) {
       // Individual orders 500 on corrupt records; skip rather than abort the
       // whole build, and keep whatever we already had for that job number.
@@ -375,10 +411,51 @@ export class OrderIndex {
       if (filter.plantId != null && !eqIgnoreCase(entry.plantId, filter.plantId)) continue;
       if (filter.jobStatus != null && !eqIgnoreCase(entry.jobStatus, filter.jobStatus)) continue;
       if (filter.salesRep != null && !eqIgnoreCase(entry.salesRep, filter.salesRep)) continue;
+      if (filter.jobType != null && !eqIgnoreCase(entry.jobType, filter.jobType)) continue;
       if (!plantAllowed(excluded, entry.plantId)) continue;
       out.push(entry);
     }
     return out;
+  }
+
+  /**
+   * WI-5: Titan has no job-status endpoint, so the reference list is derived from
+   * the indexed orders. Deliberately NOT filtered by TITAN_EXCLUDED_PLANTS — a
+   * reference list that hides values would defeat its purpose, which is telling the
+   * model which filter values legally exist.
+   */
+  statusBreakdown(): { jobStatus: string; orders: number; booked: number; unbooked: number }[] {
+    const counts = new Map<string, { orders: number; booked: number }>();
+    for (const entry of this.entries.values()) {
+      const key = entry.jobStatus ?? "(none)";
+      let bucket = counts.get(key);
+      if (!bucket) {
+        bucket = { orders: 0, booked: 0 };
+        counts.set(key, bucket);
+      }
+      bucket.orders++;
+      if (entry.bookedDate != null) bucket.booked++;
+    }
+    return [...counts.entries()]
+      .sort((a, b) => b[1].orders - a[1].orders)
+      .map(([jobStatus, v]) => ({
+        jobStatus,
+        orders: v.orders,
+        booked: v.booked,
+        unbooked: v.orders - v.booked,
+      }));
+  }
+
+  /** Distinct jobType values with order counts (same reference-list treatment). */
+  typeBreakdown(): { jobType: string; orders: number }[] {
+    const counts = new Map<string, number>();
+    for (const entry of this.entries.values()) {
+      const key = entry.jobType ?? "(none)";
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([jobType, orders]) => ({ jobType, orders }));
   }
 
   private async loadFromDisk(): Promise<boolean> {

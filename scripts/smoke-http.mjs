@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const EXPECTED_TOOL_COUNT = 37;
+const EXPECTED_TOOL_COUNT = 41;
 const PORT = 8599;
 
 const child = spawn(process.execPath, ["dist/index.js"], {

@@ -134,7 +134,10 @@ export const toolDefs: ToolDef[] = [
     name: "list_invoices",
     title: "List invoices",
     description:
-      "Retrieves posted customer invoices, filtered by plant, customer, invoice/due/posted date ranges, ticket type, or journal ID.",
+      "Retrieves posted customer invoices, filtered by plant, customer, invoice/due/posted date " +
+      "ranges, ticket type, or journal ID. BILLED/INVOICED REVENUE (AR) ONLY — not a substitute " +
+      "for sales or bookings figures; those come from list_booked_orders or " +
+      "summarize_sales_orders with DateBasis=booked.",
     path: "/api/v1/Invoices",
     params: {
       PlantId: z.string().optional().describe("Filter by plant ID."),

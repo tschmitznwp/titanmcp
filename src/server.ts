@@ -5,7 +5,7 @@ import { toolDefs, type ToolDef } from "./tools.js";
 import { aggregateToolDefs, type ToolContext } from "./aggregates.js";
 import type { OrderIndex } from "./orderIndex.js";
 
-export const SERVER_INFO = { name: "titan-mcp", version: "1.5.0" };
+export const SERVER_INFO = { name: "titan-mcp", version: "1.7.0" };
 
 function splitArgs(
   def: ToolDef,
